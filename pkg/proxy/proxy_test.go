@@ -185,15 +185,23 @@ type captureConn struct {
 	buf bytes.Buffer
 }
 
-func (c *captureConn) Read(b []byte) (int, error)        { return 0, net.ErrClosed }
-func (c *captureConn) Write(b []byte) (int, error)       { c.mu.Lock(); defer c.mu.Unlock(); return c.buf.Write(b) }
-func (c *captureConn) Close() error                      { return nil }
-func (c *captureConn) LocalAddr() net.Addr               { return nil }
-func (c *captureConn) RemoteAddr() net.Addr              { return nil }
-func (c *captureConn) SetDeadline(time.Time) error       { return nil }
-func (c *captureConn) SetReadDeadline(time.Time) error   { return nil }
-func (c *captureConn) SetWriteDeadline(time.Time) error  { return nil }
-func (c *captureConn) Bytes() []byte                     { c.mu.Lock(); defer c.mu.Unlock(); return append([]byte{}, c.buf.Bytes()...) }
+func (c *captureConn) Read(b []byte) (int, error) { return 0, net.ErrClosed }
+func (c *captureConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(b)
+}
+func (c *captureConn) Close() error                     { return nil }
+func (c *captureConn) LocalAddr() net.Addr              { return nil }
+func (c *captureConn) RemoteAddr() net.Addr             { return nil }
+func (c *captureConn) SetDeadline(time.Time) error      { return nil }
+func (c *captureConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *captureConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *captureConn) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte{}, c.buf.Bytes()...)
+}
 
 func TestStreamReassemblyInOrder(t *testing.T) {
 	conn := &captureConn{}

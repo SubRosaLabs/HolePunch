@@ -16,10 +16,8 @@ import (
 
 // constants
 const (
-	RekeyAfterTime   = 120 * time.Second // Rekey after 2 minutes
-	RejectAfterTime  = 180 * time.Second // Reject session after 3 minutes
-	KeepaliveTimeout = 25 * time.Second  // Keepalive interval
-	ReplayWindowSize = 2048              // Replay protection window size
+	KeepaliveTimeout = 25 * time.Second // Keepalive interval
+	ReplayWindowSize = 2048             // Replay protection window size
 )
 
 // KeyPair holds a public/private key pair for X25519
@@ -61,7 +59,6 @@ type Encryptor struct {
 	cipher      cipher.AEAD
 	sendCounter uint64
 	recvWindow  *ReplayWindow
-	createdAt   time.Time
 	mu          sync.Mutex
 }
 
@@ -121,7 +118,7 @@ func (w *ReplayWindow) Check(seq uint64) bool {
 	return true
 }
 
-// NewEncryptor creates a new encryptor from a shared secret ()
+// NewEncryptor creates a new encryptor from a shared secret
 func NewEncryptor(sharedSecret [32]byte) (*Encryptor, error) {
 	c, err := chacha20poly1305.NewX(sharedSecret[:])
 	if err != nil {
@@ -131,22 +128,7 @@ func NewEncryptor(sharedSecret [32]byte) (*Encryptor, error) {
 		cipher:      c,
 		sendCounter: 0,
 		recvWindow:  NewReplayWindow(),
-		createdAt:   time.Now(),
 	}, nil
-}
-
-// NeedsRekey returns true if session should be rekeyed ()
-func (e *Encryptor) NeedsRekey() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return time.Since(e.createdAt) > RekeyAfterTime
-}
-
-// IsExpired returns true if the session is too old
-func (e *Encryptor) IsExpired() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return time.Since(e.createdAt) > RejectAfterTime
 }
 
 // Encrypt encrypts plaintext with counter-based nonce ()
@@ -166,19 +148,21 @@ func (e *Encryptor) Encrypt(plaintext []byte) (nonce [24]byte, ciphertext []byte
 	return nonce, ciphertext, nil
 }
 
-// Decrypt decrypts ciphertext with replay protection ()
+// Decrypt decrypts ciphertext with replay protection.
+//
+// AEAD verification runs BEFORE updating the replay window: otherwise a
+// forged packet with a high counter could advance the window and lock out
+// subsequent legitimate packets at lower counters. Only authenticated
+// packets are allowed to advance window state.
 func (e *Encryptor) Decrypt(nonce [24]byte, ciphertext []byte) ([]byte, error) {
-	// Extract counter for replay protection
-	counter := binary.LittleEndian.Uint64(nonce[:8])
-
-	// Check replay window
-	if !e.recvWindow.Check(counter) {
-		return nil, errors.New("replay attack detected")
-	}
-
 	plaintext, err := e.cipher.Open(nil, nonce[:], ciphertext, nil)
 	if err != nil {
 		return nil, errors.New("decryption failed: " + err.Error())
+	}
+
+	counter := binary.LittleEndian.Uint64(nonce[:8])
+	if !e.recvWindow.Check(counter) {
+		return nil, errors.New("replay attack detected")
 	}
 	return plaintext, nil
 }

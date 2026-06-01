@@ -24,13 +24,31 @@ Requires Go 1.24+. Pre-built binaries: [Releases](https://github.com/abb3rrant/H
 
 ## Quick start
 
-Three roles, two binaries:
+Three roles, two binaries. Operator role is gated by an Ed25519 keypair —
+without a key the client runs as a passive agent, period.
 
 | Role | Binary | Needs |
 |---|---|---|
-| Orchestrator | `holepunch-server` | Public IP, UDP/41234 open inbound |
-| Agent | `holepunch-client` | Outbound UDP only, no root |
-| Operator | `holepunch-client` | Sudo only for TUN mode |
+| Orchestrator | `holepunch-server` | Public IP, UDP/41234 open inbound, `authorized_keys` file |
+| Agent | `holepunch-client` | Outbound UDP only, no root, **no key** |
+| Operator | `holepunch-client` | Ed25519 private key + sudo (TUN only) |
+
+**0. One-time operator setup**
+
+On your operator box, generate a keypair:
+
+```bash
+./holepunch-client -keygen ~/.holepunch/operator.key
+# Generated Ed25519 operator keypair:
+#   private: ~/.holepunch/operator.key (0600)
+#   public:  ~/.holepunch/operator.key.pub (0644)
+#
+# Add this line to the orchestrator's authorized_keys file:
+#   z9Rk8...44chars==  # operator@kali
+```
+
+Copy the printed line into `authorized_keys` on the orchestrator (one base64
+pubkey per line; `#` for comments).
 
 **1. Orchestrator (public VPS)**
 
@@ -38,8 +56,13 @@ Three roles, two binaries:
 ./holepunch-server
 # 2026/04/23 22:30:00 HolePunch v1.0.0
 # 2026/04/23 22:30:00 Listening on 0.0.0.0:41234 (max clients: 100)
+# 2026/04/23 22:30:00 Loaded 1 operator key(s) from ./authorized_keys
 [HolePunch] >>
 ```
+
+`-authorized-keys <path>` overrides the default `./authorized_keys`. If the
+file is missing or empty the server logs a loud warning and runs with zero
+operators allowed (so every connected client stays an agent).
 
 **2. Agent (target machine)**
 
@@ -49,16 +72,25 @@ Three roles, two binaries:
 # Registered with server
 ```
 
-Passive — leave it running.
+Passive — leave it running. No key means no operator commands in the shell
+and no peer-list visibility; a captured binary can't enumerate the fleet or
+request punches.
 
 **3. Operator (your box)**
 
 ```bash
-sudo ./holepunch-client -server vps.example.com:41234   # sudo only for TUN
+sudo ./holepunch-client -server vps.example.com:41234 -key ~/.holepunch/operator.key
+# Client ID: 8964d3cdd927e4c5
+# Registered with server
+# Operator authentication granted
 # Agent discovered: 8964d3cd at 162.243.95.178:55279
 [HolePunch] >> session 8964
 Session: 8964d3cd
 ```
+
+If `Operator authentication denied` shows instead, the orchestrator either
+isn't running with your pubkey in its `authorized_keys` or the file's empty —
+the agent shell still works but the operator commands are gated off.
 
 Now pick a mode.
 
@@ -146,7 +178,8 @@ stats | version | help | quit
 ### Orchestrator
 
 ```
-clients         List registered clients with endpoints and last-seen
+clients         List registered clients with endpoints, role, and last-seen
+operators       List authorized operators and current connection status
 stats           Traffic counters + uptime
 version | help | quit
 ```
@@ -154,8 +187,12 @@ version | help | quit
 ## Flags
 
 ```
-holepunch-server [-bind 0.0.0.0] [-port 41234] [-max-clients 100] [-6] [-version]
+holepunch-server [-bind 0.0.0.0] [-port 41234] [-max-clients 100] [-6]
+                 [-authorized-keys ./authorized_keys] [-version]
+
 holepunch-client [-server localhost:41234] [-6] [-version]
+                 [-key <path>]                # run as operator with this Ed25519 private key
+                 [-keygen <path>]             # one-shot: generate operator keypair and exit
 ```
 
 ## Limitations
@@ -165,7 +202,14 @@ holepunch-client [-server localhost:41234] [-6] [-version]
 - **`nmap -sS`** uses raw sockets on the operator and bypasses the tunnel — use `-sT`.
 - **SOCKS5 UDP ASSOCIATE** is not implemented (TCP only).
 - **IPv4 only** on the data plane (orchestrator coordination supports `-6`).
-- **No orchestrator auth** — run on a non-obvious port or behind a firewall allowlist.
+- **Agents are unauthenticated.** Anyone who runs the binary can register as an
+  agent and show up in operators' peer lists. Operator auth only gates the
+  ability to *use* the fleet, not to *join* it. Add a per-agent allowlist on
+  the orchestrator if you need stronger fleet-membership control.
+- **No orchestrator-identity pinning on clients.** Clients trust whatever
+  orchestrator address they were pointed at. If the orchestrator is MITM'd at
+  the network level, the operator's auth signature is still bound to the
+  attacker's session nonce — but the punch coordination itself can be tampered.
 
 ## License
 

@@ -107,23 +107,24 @@ func IsProxyPacket(data []byte) bool {
 //
 // To keep the application-level TCP byte stream intact over UDP transport,
 // each direction maintains its own monotonically increasing Seq:
-//   sendSeq:   next outbound seq to stamp (incremented per TCPData packet sent)
-//   recvSeq:   next inbound seq we expect to write to Conn
-//   recvBuf:   out-of-order packets, keyed by Seq, drained when recvSeq advances
-//   maxBuffered: cap to bound memory in case of persistent loss
+//
+//	sendSeq:   next outbound seq to stamp (incremented per TCPData packet sent)
+//	recvSeq:   next inbound seq we expect to write to Conn
+//	recvBuf:   out-of-order packets, keyed by Seq, drained when recvSeq advances
+//	maxBuffered: cap to bound memory in case of persistent loss
 type TCPStream struct {
-	ID         uint32
-	Conn       net.Conn
-	PeerID     [32]byte
-	DstAddr    string
-	Ready      chan struct{} // Signals connection is ready
-	Error      error
-	closed     bool
-	mu         sync.Mutex
+	ID      uint32
+	Conn    net.Conn
+	PeerID  [32]byte
+	DstAddr string
+	Ready   chan struct{} // Signals connection is ready
+	Error   error
+	closed  bool
+	mu      sync.Mutex
 
-	sendSeq    uint32
-	recvSeq    uint32
-	recvBuf    map[uint32][]byte
+	sendSeq uint32
+	recvSeq uint32
+	recvBuf map[uint32][]byte
 }
 
 const tcpStreamReorderBufferLimit = 256
@@ -222,7 +223,7 @@ const (
 
 // TCP states
 const (
-	TCPStateClosed = iota
+	TCPStateClosed     = iota
 	TCPStateConnecting // dial in progress; no SYN-ACK sent yet
 	TCPStateSynReceived
 	TCPStateEstablished
@@ -1010,22 +1011,44 @@ func (m *Manager) handleTUNTCP(peerID [32]byte, srcIP, dstIP net.IP, tcpSegment 
 		log.Printf("TUN: TCP established %s:%d -> %s:%d", srcIP, srcPort, dstIP, dstPort)
 	}
 
-	// Handle data
+	// Handle data. The operator's kernel will retransmit a segment if our
+	// synthesized ACK is lost on the UDP transport. We must dedup against
+	// tc.AckNum (the next byte we expect) or we'd write duplicate bytes to
+	// the real connection. Comparisons use int32 wraparound math since TCP
+	// seq numbers are mod 2^32.
 	if len(tcpSegment) > dataOffset && tc.State == TCPStateEstablished {
 		data := tcpSegment[dataOffset:]
-		tc.AckNum = seqNum + uint32(len(data))
-		tc.mu.Unlock()
+		segEnd := seqNum + uint32(len(data))
 
-		// Write data to real connection
-		_, err := tc.Conn.Write(data)
-		if err != nil {
-			log.Printf("TUN: TCP write error: %v", err)
-			m.closeTUNConn(connKey)
-			m.sendTCPReset(peerID, dstIP, srcIP, dstPort, srcPort, 0, tc.AckNum)
+		// Already-delivered duplicate? Re-ACK so the peer stops retrying.
+		if int32(segEnd-tc.AckNum) <= 0 {
+			tc.mu.Unlock()
+			m.sendTCPAck(peerID, tc)
 			return nil
 		}
 
-		// Send ACK
+		// Gap before this segment? Drop — we don't buffer. Re-ACK at the
+		// byte we still expect so the peer retransmits the missing piece.
+		if int32(seqNum-tc.AckNum) > 0 {
+			tc.mu.Unlock()
+			m.sendTCPAck(peerID, tc)
+			return nil
+		}
+
+		// In-order or partial overlap: trim any already-delivered prefix.
+		if int32(seqNum-tc.AckNum) < 0 {
+			data = data[tc.AckNum-seqNum:]
+		}
+		tc.AckNum = segEnd
+		tc.mu.Unlock()
+
+		if _, err := tc.Conn.Write(data); err != nil {
+			log.Printf("TUN: TCP write error: %v", err)
+			m.closeTUNConn(connKey)
+			m.sendTCPReset(peerID, dstIP, srcIP, dstPort, srcPort, 0, segEnd)
+			return nil
+		}
+
 		m.sendTCPAck(peerID, tc)
 		return nil
 	}
