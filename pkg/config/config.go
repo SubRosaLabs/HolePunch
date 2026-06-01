@@ -54,9 +54,6 @@ type ClientConfig struct {
 	IPv6           bool          `json:"ipv6"`
 	Keepalive      time.Duration `json:"keepalive"`
 	ConnectTimeout time.Duration `json:"connect_timeout"`
-	AutoReconnect  bool          `json:"auto_reconnect"`
-	ReconnectDelay time.Duration `json:"reconnect_delay"`
-	MaxReconnects  int           `json:"max_reconnects"`
 	LogLevel       string        `json:"log_level"`
 	TUNIP          string        `json:"tun_ip"`
 	TUNName        string        `json:"tun_name"`
@@ -79,9 +76,6 @@ func DefaultClientConfig() *ClientConfig {
 		IPv6:           false,
 		Keepalive:      DefaultKeepalive,
 		ConnectTimeout: DefaultConnectTimeout,
-		AutoReconnect:  true,
-		ReconnectDelay: 5 * time.Second,
-		MaxReconnects:  10,
 		LogLevel:       "info",
 		TUNIP:          DefaultTUNIP,
 		TUNName:        DefaultTUNName,

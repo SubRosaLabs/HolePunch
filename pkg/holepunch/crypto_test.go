@@ -2,6 +2,7 @@ package holepunch
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -242,21 +243,37 @@ func TestCounterBasedNonce(t *testing.T) {
 	}
 }
 
-func TestSessionExpiry(t *testing.T) {
+// TestForgedHighCounterDoesNotLockOutValidPackets guards the AEAD-first
+// Decrypt ordering. Previously, the replay window advanced on counter parse
+// alone, so a forged packet with a high counter could cause subsequent valid
+// packets to be rejected as "too old". The fix runs cipher.Open BEFORE
+// touching the window.
+func TestForgedHighCounterDoesNotLockOutValidPackets(t *testing.T) {
 	kp1, _ := GenerateKeyPair()
 	kp2, _ := GenerateKeyPair()
 
 	secret, _ := ComputeSharedSecret(&kp1.PrivateKey, &kp2.PublicKey)
+	enc1, _ := NewEncryptor(secret)
+	enc2, _ := NewEncryptor(secret)
 
-	enc, _ := NewEncryptor(secret)
-
-	// Fresh session should not need rekey
-	if enc.NeedsRekey() {
-		t.Error("Fresh session should not need rekey")
+	validNonce, validCT, err := enc1.Encrypt([]byte("legit"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
 	}
 
-	if enc.IsExpired() {
-		t.Error("Fresh session should not be expired")
+	// Forge a "packet" with a high counter and a bogus ciphertext.
+	// The receiver should reject it AND keep the replay window intact.
+	var forgedNonce [24]byte
+	binary.LittleEndian.PutUint64(forgedNonce[:8], uint64(ReplayWindowSize)*4)
+	forgedCT := []byte("not-a-valid-aead-tagged-payload-xxxxxxxxxx")
+
+	if _, err := enc2.Decrypt(forgedNonce, forgedCT); err == nil {
+		t.Fatal("forged packet should fail decrypt")
+	}
+
+	// The legitimate packet (counter=1) must still decrypt.
+	if _, err := enc2.Decrypt(validNonce, validCT); err != nil {
+		t.Fatalf("valid packet was locked out by forged advance: %v", err)
 	}
 }
 

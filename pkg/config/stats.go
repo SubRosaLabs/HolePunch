@@ -24,7 +24,6 @@ type Stats struct {
 	// Connection stats
 	Connections   uint64
 	ActiveStreams int64
-	Reconnects    uint64
 
 	// Timing
 	StartTime    time.Time
@@ -88,11 +87,6 @@ func (s *Stats) AddConnection() {
 	atomic.AddUint64(&s.Connections, 1)
 }
 
-// AddReconnect increments reconnect counter
-func (s *Stats) AddReconnect() {
-	atomic.AddUint64(&s.Reconnects, 1)
-}
-
 // SetActiveStreams sets the active stream count
 func (s *Stats) SetActiveStreams(n int64) {
 	atomic.StoreInt64(&s.ActiveStreams, n)
@@ -142,7 +136,6 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		DroppedPackets:  atomic.LoadUint64(&s.DroppedPackets),
 		Connections:     atomic.LoadUint64(&s.Connections),
 		ActiveStreams:   atomic.LoadInt64(&s.ActiveStreams),
-		Reconnects:      atomic.LoadUint64(&s.Reconnects),
 		Uptime:          s.Uptime(),
 		IdleTime:        time.Since(s.LastActivity),
 	}
@@ -160,7 +153,6 @@ type StatsSnapshot struct {
 	DroppedPackets  uint64
 	Connections     uint64
 	ActiveStreams   int64
-	Reconnects      uint64
 	Uptime          time.Duration
 	IdleTime        time.Duration
 }

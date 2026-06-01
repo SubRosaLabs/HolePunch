@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/abb3rrant/HolePunch/pkg/auth"
 	"github.com/abb3rrant/HolePunch/pkg/config"
 	"github.com/abb3rrant/HolePunch/pkg/holepunch"
 	"github.com/abb3rrant/HolePunch/pkg/protocol"
@@ -33,21 +35,29 @@ type Client struct {
 	puncher      *holepunch.Puncher
 	peers        map[string]*PeerEntry
 	peersMu      sync.RWMutex
-	registered   bool
 	shutdown     chan struct{}
 	proxyManager *proxy.Manager
 	stats        *config.Stats
 	startTime    time.Time
 
+	// Operator auth. edPrivKey is nil when no -key was passed; in that case
+	// the client runs as a passive agent and operator commands are gated off
+	// in the interactive shell. sessionNonce arrives in RegisterAck and is
+	// only read/written from the single receiveLoop goroutine.
+	edPrivKey    ed25519.PrivateKey
+	sessionNonce [32]byte
+
 	// Tunnel state — guarded by stateMu where multi-goroutine access matters.
 	// Most writes happen on the interactive command goroutine; reads from
-	// tunReadLoop / tunWritePacket take the mutex.
+	// tunReadLoop / tunWritePacket take the mutex. isOperator also lives here
+	// so the role check is atomic against AuthResult arrival.
 	stateMu       sync.RWMutex
 	session       *PeerEntry
 	tunnelStarted bool
 	tunnelIface   string
 	tunnelRoutes  []string
 	tunFile       *os.File // TUN device file descriptor
+	isOperator    bool
 }
 
 type PeerEntry struct {
@@ -57,7 +67,10 @@ type PeerEntry struct {
 	Connected bool
 }
 
-func NewClient(serverAddr string, useIPv6 bool) (*Client, error) {
+// NewClient builds a client. edPrivKey is the operator Ed25519 private key
+// loaded from disk via -key; pass nil to run as a passive agent (no operator
+// commands available, no auth attempted).
+func NewClient(serverAddr string, useIPv6 bool, edPrivKey ed25519.PrivateKey) (*Client, error) {
 	network := "udp4"
 	if useIPv6 {
 		network = "udp6"
@@ -92,6 +105,7 @@ func NewClient(serverAddr string, useIPv6 bool) (*Client, error) {
 		shutdown:   make(chan struct{}),
 		stats:      config.NewStats(),
 		startTime:  time.Now(),
+		edPrivKey:  edPrivKey,
 	}
 
 	client.puncher = holepunch.NewPuncher(conn, keys)
@@ -169,12 +183,40 @@ func (c *Client) handleServerPacket(data []byte) {
 		return
 	}
 
+	if header.Version != protocol.WireVersion {
+		log.Printf("Server protocol version mismatch: got v%d, want v%d", header.Version, protocol.WireVersion)
+		return
+	}
+
 	payload := data[protocol.HeaderSize:]
 
 	switch header.Type {
 	case protocol.MsgTypeRegisterAck:
-		c.registered = true
+		ack, err := protocol.ParseRegisterAckMessage(payload)
+		if err != nil {
+			log.Printf("Failed to parse register ack: %v", err)
+			return
+		}
+		c.sessionNonce = ack.SessionNonce
 		log.Println("Registered with server")
+		if c.edPrivKey != nil {
+			c.sendAuthRequest()
+		}
+
+	case protocol.MsgTypeAuthResult:
+		res, err := protocol.ParseAuthResultMessage(payload)
+		if err != nil {
+			log.Printf("Failed to parse auth result: %v", err)
+			return
+		}
+		if res.Granted {
+			c.stateMu.Lock()
+			c.isOperator = true
+			c.stateMu.Unlock()
+			log.Println("Operator authentication granted")
+		} else {
+			log.Println("Operator authentication denied — continuing as agent")
+		}
 
 	case protocol.MsgTypePeerList:
 		c.handlePeerList(payload)
@@ -182,6 +224,37 @@ func (c *Client) handleServerPacket(data []byte) {
 	case protocol.MsgTypePunchInit:
 		c.handlePunchInit(payload)
 	}
+}
+
+// sendAuthRequest signs the server-provided session nonce and our clientID
+// with our Ed25519 private key, then ships the request. Called from the
+// receiveLoop goroutine right after we process RegisterAck.
+func (c *Client) sendAuthRequest() {
+	var pub [auth.PublicKeySize]byte
+	copy(pub[:], c.edPrivKey.Public().(ed25519.PublicKey))
+
+	sig := auth.Sign(c.edPrivKey, c.sessionNonce, c.clientID)
+	msg := &protocol.AuthRequestMessage{PublicKey: pub, Signature: sig}
+	c.conn.WriteToUDP(msg.Serialize(), c.serverAddr)
+}
+
+// operatorRole reports whether the server granted us operator role. Safe to
+// call from any goroutine.
+func (c *Client) operatorRole() bool {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.isOperator
+}
+
+// requireOperator gates an operator-only command. Prints a one-line refusal
+// (using cmd as the verb) and returns false when the client is not yet
+// authenticated.
+func (c *Client) requireOperator(cmd string) bool {
+	if c.operatorRole() {
+		return true
+	}
+	fmt.Printf("%s: operator key required (start the client with -key <path>)\n", cmd)
+	return false
 }
 
 func (c *Client) handlePeerList(data []byte) {
@@ -287,7 +360,7 @@ func (c *Client) keepaliveLoop() {
 	ticker := time.NewTicker(holepunch.KeepaliveTimeout)
 	defer ticker.Stop()
 
-	keepalive := protocol.Header{Version: 1, Type: protocol.MsgTypeKeepalive, Length: 0}
+	keepalive := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypeKeepalive, Length: 0}
 	keepaliveData := keepalive.Serialize()
 
 	for {
@@ -328,19 +401,33 @@ func (c *Client) interactiveMode() {
 		case "help", "?":
 			c.printHelp()
 		case "session":
-			c.cmdSession(args[1:])
+			if c.requireOperator("session") {
+				c.cmdSession(args[1:])
+			}
 		case "tunnel":
-			c.cmdTunnel(args[1:])
+			if c.requireOperator("tunnel") {
+				c.cmdTunnel(args[1:])
+			}
 		case "route":
-			c.cmdRoute(args[1:])
+			if c.requireOperator("route") {
+				c.cmdRoute(args[1:])
+			}
 		case "ifconfig":
-			c.cmdIfconfig()
+			if c.requireOperator("ifconfig") {
+				c.cmdIfconfig()
+			}
 		case "agents", "peers":
-			c.cmdAgents()
+			if c.requireOperator("agents") {
+				c.cmdAgents()
+			}
 		case "listener", "forward":
-			c.cmdListener(args[1:])
+			if c.requireOperator("listener") {
+				c.cmdListener(args[1:])
+			}
 		case "socks":
-			c.cmdSocks(args[1:])
+			if c.requireOperator("socks") {
+				c.cmdSocks(args[1:])
+			}
 		case "stats":
 			c.cmdStats()
 		case "version":
@@ -366,11 +453,24 @@ func (c *Client) printBanner() {
 }
 
 func (c *Client) printHelp() {
+	if !c.operatorRole() {
+		// Agent mode: hide operator commands entirely. A captured binary's
+		// help output should look benign — no hints about what it could do
+		// with an operator key.
+		fmt.Print(`
+Commands:
+  stats                       - Show connection statistics
+  version                     - Show version info
+  help                        - Show this help
+  quit                        - Exit
+`)
+		return
+	}
 	fmt.Print(`
 Commands:
   agents                      - List connected agents
   session [id]                - Select agent for tunneling
-  
+
 Tunnel (Linux operator, requires sudo):
   tunnel start                - Start TUN interface
   tunnel stop                 - Stop TUN interface
@@ -381,7 +481,7 @@ Tunnel (Linux operator, requires sudo):
 
 Listeners (no root needed):
   listener add <local>:<remote> - Forward local port to remote via agent
-  listener del <port>           - Remove listener  
+  listener del <port>           - Remove listener
   listener list                 - Show listeners
 
 SOCKS (no root needed):
@@ -473,7 +573,7 @@ func (c *Client) cmdSession(args []string) {
 	}
 
 	if !target.Connected {
-		header := protocol.Header{Version: 1, Type: protocol.MsgTypePunchRequest, Length: 32}
+		header := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypePunchRequest, Length: 32}
 		msg := header.Serialize()
 		msg = append(msg, target.ID[:]...)
 		c.conn.WriteToUDP(msg, c.serverAddr)
@@ -910,15 +1010,59 @@ func (c *Client) Shutdown() {
 	if c.proxyManager != nil {
 		c.proxyManager.Close()
 	}
-	header := protocol.Header{Version: 1, Type: protocol.MsgTypeDisconnect, Length: 0}
+	header := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypeDisconnect, Length: 0}
 	c.conn.WriteToUDP(header.Serialize(), c.serverAddr)
 	close(c.shutdown)
 	c.conn.Close()
 }
 
+// runKeygen generates an Ed25519 operator keypair at path (private) and
+// path+".pub" (public, authorized_keys-line format). Refuses to overwrite
+// existing files — losing a key silently is far worse than a one-line error.
+func runKeygen(path string) error {
+	for _, p := range []string{path, path + ".pub"} {
+		if _, err := os.Stat(p); err == nil {
+			return fmt.Errorf("%s already exists — refusing to overwrite", p)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s: %w", p, err)
+		}
+	}
+
+	pub, priv, err := auth.GenerateKeypair()
+	if err != nil {
+		return fmt.Errorf("generate keypair: %w", err)
+	}
+
+	label := ""
+	if host, err := os.Hostname(); err == nil && host != "" {
+		label = "operator@" + host
+	}
+
+	if err := auth.SavePrivateKey(path, priv); err != nil {
+		return fmt.Errorf("save private key: %w", err)
+	}
+	if err := auth.SavePublicKey(path+".pub", pub, label); err != nil {
+		return fmt.Errorf("save public key: %w", err)
+	}
+
+	fmt.Println("Generated Ed25519 operator keypair:")
+	fmt.Printf("  private: %s (0600)\n", path)
+	fmt.Printf("  public:  %s (0644)\n", path+".pub")
+	fmt.Println()
+	fmt.Println("Add this line to the orchestrator's authorized_keys file:")
+	line := auth.EncodePublicKey(pub)
+	if label != "" {
+		line += " # " + label
+	}
+	fmt.Println("  " + line)
+	return nil
+}
+
 func main() {
 	serverAddr := flag.String("server", "localhost:41234", "Server address")
 	ipv6 := flag.Bool("6", false, "Use IPv6")
+	keyPath := flag.String("key", "", "Path to Ed25519 operator private key (32-byte seed). Without this, runs as a passive agent.")
+	keygenPath := flag.String("keygen", "", "Generate Ed25519 operator keypair at <path> (writes <path> and <path>.pub) and exit.")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
 
@@ -927,7 +1071,23 @@ func main() {
 		os.Exit(0)
 	}
 
-	client, err := NewClient(*serverAddr, *ipv6)
+	if *keygenPath != "" {
+		if err := runKeygen(*keygenPath); err != nil {
+			log.Fatalf("Keygen failed: %v", err)
+		}
+		return
+	}
+
+	var edPriv ed25519.PrivateKey
+	if *keyPath != "" {
+		k, err := auth.LoadPrivateKey(*keyPath)
+		if err != nil {
+			log.Fatalf("Load operator key: %v", err)
+		}
+		edPriv = k
+	}
+
+	client, err := NewClient(*serverAddr, *ipv6, edPriv)
 	if err != nil {
 		log.Fatalf("Failed: %v", err)
 	}

@@ -259,18 +259,28 @@ func (p *Puncher) handleData(data []byte, addr *net.UDPAddr) error {
 		return nil
 	}
 
-	// roaming: update endpoint on successful decryption
+	// Roaming: update endpoint on successful decryption.
+	//
+	// Locks are NOT nested: we touch peer.mu and peersMu in separate
+	// critical sections, in that order. Everywhere else in this package
+	// the order is peersMu → peer.mu, so nesting them in the reverse
+	// order here would risk deadlock against e.g. AddAllowedIP or
+	// handleKeyExchange running concurrently.
 	peer.mu.Lock()
-	if peer.Addr.String() != addr.String() {
-		// Peer roamed to new endpoint
-		p.peersMu.Lock()
-		delete(p.addrToPeer, peer.Addr.String())
+	oldAddrStr := peer.Addr.String()
+	roamed := oldAddrStr != addr.String()
+	if roamed {
 		peer.Addr = addr
-		p.addrToPeer[addr.String()] = peer.PeerID
-		p.peersMu.Unlock()
 	}
 	peer.LastSeen = time.Now()
 	peer.mu.Unlock()
+
+	if roamed {
+		p.peersMu.Lock()
+		delete(p.addrToPeer, oldAddrStr)
+		p.addrToPeer[addr.String()] = peer.PeerID
+		p.peersMu.Unlock()
+	}
 
 	if p.onData != nil {
 		go p.onData(peer.PeerID, plaintext)
@@ -320,7 +330,7 @@ func (p *Puncher) SendToPeer(peerID [32]byte, data []byte) error {
 
 // SendKeepalive sends keepalive to all peers
 func (p *Puncher) SendKeepalive() {
-	keepalive := protocol.Header{Version: 1, Type: protocol.MsgTypeKeepalive, Length: 0}
+	keepalive := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypeKeepalive, Length: 0}
 	data := keepalive.Serialize()
 
 	p.peersMu.RLock()
