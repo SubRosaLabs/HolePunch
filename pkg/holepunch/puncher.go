@@ -283,7 +283,7 @@ func (p *Puncher) handleData(data []byte, addr *net.UDPAddr) error {
 	}
 
 	if p.onData != nil {
-		go p.onData(peer.PeerID, plaintext)
+		p.onData(peer.PeerID, plaintext)
 	}
 
 	return nil
