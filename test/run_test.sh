@@ -49,6 +49,8 @@ wait_for_log() {
 wait_for_log mybox1 "Port forward ready"       "SMB listener up"       90
 wait_for_log mybox1 "HTTP listener ready"      "HTTP listener up"       30
 wait_for_log mybox1 "Reverse listener ready"   "rlistener up"           30
+wait_for_log mybox1 "SOCKS5 ready"             "SOCKS5 proxy up"        30
+wait_for_log mybox1 "TUN ready"                "TUN interface up"       30
 
 echo ""
 
@@ -205,6 +207,42 @@ if echo "$STRESS_OUT" | grep -q "STRESS PASSED"; then
     pass "TEST 5: stress test — 30 concurrent connections all succeeded"
 else
     fail "TEST 5: stress test failed"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 6 — SOCKS5: proxy from MyBox1 -> OrgBox2:8080"
+echo "════════════════════════════════════════════════════════"
+
+SOCKS_RESP=$(docker compose exec -T mybox1 \
+    curl -s --socks5 127.0.0.1:1080 --max-time 15 http://172.30.0.10:8080/ 2>/dev/null || true)
+echo "[test] socks5 response length: ${#SOCKS_RESP}"
+
+if echo "$SOCKS_RESP" | grep -q "OrgBox2"; then
+    pass "TEST 6: SOCKS5 proxy reached OrgBox2 via agent"
+else
+    echo "── MyBox1 hp log (tail) ────────────────────────────────"
+    docker compose logs mybox1 | tail -15
+    fail "TEST 6: SOCKS5 proxy did NOT reach OrgBox2"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 7 — TUN: direct IP routing MyBox1 -> 172.30.0.10"
+echo "════════════════════════════════════════════════════════"
+
+TUN_RESP=$(docker compose exec -T mybox1 \
+    curl -s --max-time 15 http://172.30.0.10:8080/ 2>/dev/null || true)
+echo "[test] tun response length: ${#TUN_RESP}"
+
+if echo "$TUN_RESP" | grep -q "OrgBox2"; then
+    pass "TEST 7: TUN IP routing reached OrgBox2 via agent"
+else
+    echo "── MyBox1 hp log (tail) ────────────────────────────────"
+    docker compose logs mybox1 | tail -15
+    fail "TEST 7: TUN IP routing did NOT reach OrgBox2"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -78,6 +78,8 @@ services:
       MYBOX2: "mybox2"
     cap_add:
       - NET_ADMIN
+    devices:
+      - /dev/net/tun    # required for TUN test (tunnel start)
     volumes:
       - ./keys:/keys:ro
       - ./scripts:/scripts:ro
