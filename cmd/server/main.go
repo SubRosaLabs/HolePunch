@@ -1,16 +1,23 @@
 // HolePunch Orchestration Server
-// Coordinates UDP hole punching between clients
+// Coordinates UDP hole punching between clients over HTTP/3
 package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,15 +25,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/crypto/acme/autocert"
+
 	"github.com/abb3rrant/HolePunch/pkg/auth"
 	"github.com/abb3rrant/HolePunch/pkg/config"
 	"github.com/abb3rrant/HolePunch/pkg/protocol"
 )
 
-// Role distinguishes passive agents from authenticated operators. Operators
-// have proved possession of an Ed25519 key whose public half appears in the
-// orchestrator's authorized_keys file; only they may request punches and
-// receive the peer list.
+// Role distinguishes passive agents from authenticated operators.
 type Role uint8
 
 const (
@@ -41,20 +48,35 @@ func (r Role) String() string {
 	return "agent"
 }
 
+// clientStream wraps an HTTP/3 ResponseWriter for concurrent server→client writes.
+type clientStream struct {
+	mu sync.Mutex
+	w  http.ResponseWriter
+	f  http.Flusher
+}
+
+func (cs *clientStream) Send(data []byte) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.w.Write(data) //nolint:errcheck — broken pipe on disconnect is normal
+	cs.f.Flush()
+}
+
 // ClientInfo stores information about a connected client.
 type ClientInfo struct {
 	ID           [32]byte
-	PublicKey    [32]byte // X25519 traffic key
-	Addr         *net.UDPAddr
+	PublicKey    [32]byte
+	Addr         *net.UDPAddr             // external QUIC source = hole-punch endpoint
 	LastSeen     time.Time
 	Role         Role
-	SessionNonce [32]byte                 // Server-generated per registration; client signs this to auth as operator
-	EdPubKey     [auth.PublicKeySize]byte // Set when authenticated; zero for agents
+	SessionNonce [32]byte
+	EdPubKey     [auth.PublicKeySize]byte
+	stream       *clientStream
 }
 
 // Server is the orchestration server.
 type Server struct {
-	conn       *net.UDPConn
+	h3server   *http3.Server
 	clients    map[[32]byte]*ClientInfo
 	mu         sync.RWMutex
 	shutdown   chan struct{}
@@ -62,113 +84,154 @@ type Server struct {
 	stats      *config.Stats
 	authorized auth.AuthorizedKeys
 	authPath   string
+	agentPath  string
 }
 
-// NewServer creates a new orchestration server. authPath points at the
-// operator authorized_keys file; a missing/empty file is not fatal — the
-// server runs with zero operators allowed and logs a warning.
-func NewServer(addr string, useIPv6 bool, maxClients int, authPath string) (*Server, error) {
-	network := "udp4"
-	if useIPv6 {
-		network = "udp6"
-	}
-
-	udpAddr, err := net.ResolveUDPAddr(network, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve address: %w", err)
-	}
-
-	conn, err := net.ListenUDP(network, udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen: %w", err)
-	}
-
+// NewServer creates a new orchestration server.
+func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Config, webroot string) (*Server, error) {
 	authorized, err := auth.LoadAuthorizedKeys(authPath)
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("load authorized_keys %s: %w", authPath, err)
 	}
 
-	return &Server{
-		conn:       conn,
+	s := &Server{
 		clients:    make(map[[32]byte]*ClientInfo),
 		shutdown:   make(chan struct{}),
 		maxClients: maxClients,
 		stats:      config.NewStats(),
 		authorized: authorized,
 		authPath:   authPath,
-	}, nil
+		agentPath:  agentPath,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(agentPath, s.agentHandler)
+	if webroot != "" {
+		mux.Handle("/", http.FileServer(http.Dir(webroot)))
+	} else {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		})
+	}
+
+	s.h3server = &http3.Server{
+		Addr:      addr,
+		Handler:   mux,
+		TLSConfig: tlsConf,
+	}
+
+	return s, nil
 }
 
-// Run starts the server
+// Run starts the server.
 func (s *Server) Run() error {
 	log.Printf("%s", config.VersionInfo())
-	log.Printf("Listening on %s (max clients: %d)", s.conn.LocalAddr().String(), s.maxClients)
+	log.Printf("Listening on %s (HTTP/3, max clients: %d)", s.h3server.Addr, s.maxClients)
+	log.Printf("Agent path: %s", s.agentPath)
 	if len(s.authorized) == 0 {
 		log.Printf("WARNING: no operator keys loaded from %s — all clients will be agent-only", s.authPath)
 	} else {
 		log.Printf("Loaded %d operator key(s) from %s", len(s.authorized), s.authPath)
 	}
 
-	// Start cleanup goroutine
 	go s.cleanupStaleClients()
 	go s.logStats()
-	// Read-only interactive CLI (TTY only).
 	go s.interactiveMode()
 
-	buf := make([]byte, 65535)
+	return s.h3server.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the server.
+func (s *Server) Shutdown() {
+	log.Println("Shutting down...")
+	close(s.shutdown)
+	s.h3server.Close()
+}
+
+// readMsg reads one framed protocol message from a stream.
+func readMsg(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, protocol.HeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	h, err := protocol.ParseHeader(hdr)
+	if err != nil {
+		return nil, err
+	}
+	if h.Length == 0 {
+		return hdr, nil
+	}
+	payload := make([]byte, h.Length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return append(hdr, payload...), nil
+}
+
+// agentHandler is the HTTP/3 handler for agent/operator connections.
+// The request body carries client→server messages; the response body carries
+// server→client messages. Both streams stay open for the session lifetime.
+func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	remoteAddr, err := net.ResolveUDPAddr("udp", r.RemoteAddr)
+	if err != nil {
+		log.Printf("Bad remote addr %s: %v", r.RemoteAddr, err)
+		http.Error(w, "bad address", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	cs := &clientStream{w: w, f: flusher}
+
+	defer func() {
+		s.removeClientByAddr(remoteAddr)
+		s.broadcastPeerListToOperators()
+	}()
+
 	for {
-		select {
-		case <-s.shutdown:
-			return nil
-		default:
-		}
-
-		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := s.conn.ReadFromUDP(buf)
+		data, err := readMsg(r.Body)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			log.Printf("Read error: %v", err)
-			continue
+			return
 		}
-
-		s.stats.AddBytesReceived(uint64(n))
+		s.stats.AddBytesReceived(uint64(len(data)))
 		s.stats.AddPacketsReceived(1)
-		go s.handlePacket(buf[:n], addr)
+		s.handleStreamMessage(data, remoteAddr, cs)
 	}
 }
 
-func (s *Server) handlePacket(data []byte, addr *net.UDPAddr) {
+func (s *Server) handleStreamMessage(data []byte, addr *net.UDPAddr, cs *clientStream) {
 	if len(data) < protocol.HeaderSize {
-		log.Printf("Packet too small from %s", addr.String())
 		return
 	}
-
 	header, err := protocol.ParseHeader(data)
 	if err != nil {
-		log.Printf("Failed to parse header: %v", err)
 		return
 	}
-
 	if header.Version != protocol.WireVersion {
 		log.Printf("Protocol version mismatch from %s: got v%d, want v%d",
 			addr.String(), header.Version, protocol.WireVersion)
 		return
 	}
-
 	payload := data[protocol.HeaderSize:]
 
 	switch header.Type {
 	case protocol.MsgTypeRegister:
-		s.handleRegister(payload, addr)
+		s.handleRegister(payload, addr, cs)
 	case protocol.MsgTypePunchRequest:
 		s.handlePunchRequest(payload, addr)
 	case protocol.MsgTypeKeepalive:
 		s.handleKeepalive(addr)
 	case protocol.MsgTypeDisconnect:
-		s.handleDisconnect(payload, addr)
+		// handled by the stream-close path in agentHandler; nothing extra needed
 	case protocol.MsgTypeAuthRequest:
 		s.handleAuthRequest(payload, addr)
 	default:
@@ -176,8 +239,8 @@ func (s *Server) handlePacket(data []byte, addr *net.UDPAddr) {
 	}
 }
 
-// clientByAddrLocked finds the registered client whose Addr matches addr.
-// Caller must hold s.mu (R or W). Returns nil if no such client.
+// clientByAddrLocked finds a client by their QUIC remote address.
+// Caller must hold s.mu (R or W).
 func (s *Server) clientByAddrLocked(addr *net.UDPAddr) *ClientInfo {
 	for _, c := range s.clients {
 		if c.Addr.IP.Equal(addr.IP) && c.Addr.Port == addr.Port {
@@ -187,7 +250,16 @@ func (s *Server) clientByAddrLocked(addr *net.UDPAddr) *ClientInfo {
 	return nil
 }
 
-func (s *Server) handleRegister(data []byte, addr *net.UDPAddr) {
+// sendTo writes data to a client's HTTP/3 response stream.
+func (s *Server) sendTo(client *ClientInfo, data []byte) {
+	if client.stream != nil {
+		s.stats.AddBytesSent(uint64(len(data)))
+		s.stats.AddPacketsSent(1)
+		client.stream.Send(data)
+	}
+}
+
+func (s *Server) handleRegister(data []byte, addr *net.UDPAddr, cs *clientStream) {
 	msg, err := protocol.ParseRegisterMessage(data)
 	if err != nil {
 		log.Printf("Failed to parse register message: %v", err)
@@ -201,9 +273,6 @@ func (s *Server) handleRegister(data []byte, addr *net.UDPAddr) {
 	}
 
 	s.mu.Lock()
-	// Re-registration (same ClientID) is treated as a fresh session: nonce
-	// is regenerated, role drops back to agent. Operators that reconnect
-	// must re-auth from the new nonce.
 	_, exists := s.clients[msg.ClientID]
 	if !exists && len(s.clients) >= s.maxClients {
 		s.mu.Unlock()
@@ -218,21 +287,19 @@ func (s *Server) handleRegister(data []byte, addr *net.UDPAddr) {
 		LastSeen:     time.Now(),
 		Role:         RoleAgent,
 		SessionNonce: nonce,
+		stream:       cs,
 	}
 	s.clients[msg.ClientID] = client
 	clientCount := len(s.clients)
 	s.mu.Unlock()
 
 	s.stats.AddConnection()
-	log.Printf("Client registered: %s from %s (total: %d)", hex.EncodeToString(msg.ClientID[:8]), addr.String(), clientCount)
+	log.Printf("Client registered: %s from %s (total: %d)",
+		hex.EncodeToString(msg.ClientID[:8]), addr.String(), clientCount)
 
-	// Send register ack with the session nonce the client must sign to
-	// upgrade to operator role.
 	ack := &protocol.RegisterAckMessage{SessionNonce: nonce}
-	s.conn.WriteToUDP(ack.Serialize(), addr)
+	cs.Send(ack.Serialize())
 
-	// New client joining the fleet — notify existing operators. (The new
-	// client gets its peer list only after successful auth, not here.)
 	s.broadcastPeerListToOperators()
 }
 
@@ -272,10 +339,9 @@ func (s *Server) handleAuthRequest(data []byte, addr *net.UDPAddr) {
 	}
 
 	result := &protocol.AuthResultMessage{Granted: granted}
-	s.conn.WriteToUDP(result.Serialize(), addr)
+	s.sendTo(client, result.Serialize())
 
 	if granted {
-		// Send the current fleet to the newly-promoted operator.
 		s.mu.RLock()
 		s.sendPeerListToLocked(client)
 		s.mu.RUnlock()
@@ -314,49 +380,41 @@ func (s *Server) handlePunchRequest(data []byte, addr *net.UDPAddr) {
 		hex.EncodeToString(requester.ID[:8]),
 		hex.EncodeToString(target.ID[:8]))
 
-	// Tell requester about target
 	toRequester := &protocol.PunchInitMessage{
 		PeerID:        target.ID,
 		PeerPublicKey: target.PublicKey,
 		PeerAddr:      target.Addr,
 	}
-	s.conn.WriteToUDP(toRequester.Serialize(), requester.Addr)
+	s.sendTo(requester, toRequester.Serialize())
 
-	// Tell target about requester
 	toTarget := &protocol.PunchInitMessage{
 		PeerID:        requester.ID,
 		PeerPublicKey: requester.PublicKey,
 		PeerAddr:      requester.Addr,
 	}
-	s.conn.WriteToUDP(toTarget.Serialize(), target.Addr)
+	s.sendTo(target, toTarget.Serialize())
 }
 
 func (s *Server) handleKeepalive(addr *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if c := s.clientByAddrLocked(addr); c != nil {
 		c.LastSeen = time.Now()
 	}
 }
 
-func (s *Server) handleDisconnect(data []byte, addr *net.UDPAddr) {
+func (s *Server) removeClientByAddr(addr *net.UDPAddr) {
 	s.mu.Lock()
-	var removed bool
-	if c := s.clientByAddrLocked(addr); c != nil {
-		delete(s.clients, c.ID)
-		log.Printf("Client disconnected: %s", hex.EncodeToString(c.ID[:8]))
-		removed = true
+	for id, c := range s.clients {
+		if c.Addr.IP.Equal(addr.IP) && c.Addr.Port == addr.Port {
+			delete(s.clients, id)
+			log.Printf("Client disconnected: %s", hex.EncodeToString(id[:8]))
+			break
+		}
 	}
 	s.mu.Unlock()
-
-	if removed {
-		s.broadcastPeerListToOperators()
-	}
 }
 
-// sendPeerListToLocked sends the current fleet (all clients except recipient)
-// to a specific client. Caller must hold s.mu (R is enough).
 func (s *Server) sendPeerListToLocked(recipient *ClientInfo) {
 	var peerData []byte
 	peerCount := 0
@@ -394,16 +452,12 @@ func (s *Server) sendPeerListToLocked(recipient *ClientInfo) {
 	msg := header.Serialize()
 	msg = append(msg, byte(peerCount))
 	msg = append(msg, peerData...)
-	s.conn.WriteToUDP(msg, recipient.Addr)
+	s.sendTo(recipient, msg)
 }
 
-// broadcastPeerListToOperators sends an updated fleet view to every connected
-// operator. Agents never receive this — keeping a captured agent binary from
-// enumerating the rest of the fleet is the entire point of operator auth.
 func (s *Server) broadcastPeerListToOperators() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	for _, c := range s.clients {
 		if c.Role == RoleOperator {
 			s.sendPeerListToLocked(c)
@@ -459,16 +513,6 @@ func (s *Server) logStats() {
 	}
 }
 
-// Shutdown gracefully shuts down the server
-func (s *Server) Shutdown() {
-	log.Println("Shutting down...")
-	close(s.shutdown)
-	s.conn.Close()
-}
-
-// interactiveMode runs a tiny read-only CLI for the orchestrator. It is a
-// no-op when stdin isn't a TTY (e.g. when running under systemd or piped),
-// so daemon use isn't affected.
 func (s *Server) interactiveMode() {
 	if !config.StdinIsTTY() {
 		return
@@ -580,12 +624,110 @@ func (s *Server) cmdStats() {
 		snap.Connections)
 }
 
+// buildTLSConfig returns a *tls.Config based on the chosen mode.
+func buildTLSConfig(mode, certFile, keyFile, domain, cacheDir string) (*tls.Config, error) {
+	switch mode {
+	case "cert":
+		if certFile == "" || keyFile == "" {
+			return nil, fmt.Errorf("-tls-cert and -tls-key are required for cert mode")
+		}
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load cert/key: %w", err)
+		}
+		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+
+	case "letsencrypt":
+		if domain == "" {
+			return nil, fmt.Errorf("-tls-domain is required for letsencrypt mode")
+		}
+		if cacheDir == "" {
+			cacheDir = "./cert-cache"
+		}
+		m := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(domain),
+			Cache:      autocert.DirCache(cacheDir),
+		}
+		// TCP/443 listener so the ACME TLS-ALPN-01 challenge can complete.
+		// TCP and UDP on the same port coexist fine at the OS level.
+		go func() {
+			ln, err := tls.Listen("tcp4", ":443", m.TLSConfig())
+			if err != nil {
+				log.Printf("ACME challenge listener (TCP/443): %v — cert renewal may fail", err)
+				return
+			}
+			defer ln.Close()
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					c.(*tls.Conn).Handshake() //nolint:errcheck
+					c.Close()
+				}(conn)
+			}
+		}()
+		return m.TLSConfig(), nil
+
+	case "self", "":
+		return generateSelfSignedTLS()
+
+	default:
+		return nil, fmt.Errorf("unknown -tls-mode %q (use: self, cert, letsencrypt)", mode)
+	}
+}
+
+// generateSelfSignedTLS creates a self-signed ECDSA certificate valid for 10 years.
+func generateSelfSignedTLS() (*tls.Config, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "holepunch"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:         true,
+		IPAddresses:  []net.IP{net.ParseIP("0.0.0.0"), net.ParseIP("::")},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, fmt.Errorf("create cert: %w", err)
+	}
+
+	log.Printf("Generated self-signed TLS cert — agents must use -ignorecert")
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  key,
+		}},
+	}, nil
+}
+
 func main() {
-	port := flag.Int("port", 41234, "UDP port to listen on")
+	port := flag.Int("port", config.DefaultServerPort, "UDP port to listen on")
 	bind := flag.String("bind", "0.0.0.0", "Address to bind to")
-	ipv6 := flag.Bool("6", false, "Use IPv6 instead of IPv4")
 	maxClients := flag.Int("max-clients", 100, "Maximum number of clients")
-	authPath := flag.String("authorized-keys", "./authorized_keys", "Path to operator authorized_keys file (one base64 Ed25519 pubkey per line)")
+	authPath := flag.String("authorized-keys", "./authorized_keys", "Path to operator authorized_keys file")
+	agentPath := flag.String("agent-path", "/v1/metrics", "HTTP path for agent connections")
+	webroot := flag.String("webroot", "", "Directory to serve as decoy website (optional)")
+	tlsMode := flag.String("tls-mode", "self", "TLS certificate mode: self, cert, letsencrypt")
+	tlsCert := flag.String("tls-cert", "", "Path to TLS certificate file (cert mode)")
+	tlsKey := flag.String("tls-key", "", "Path to TLS private key file (cert mode)")
+	tlsDomain := flag.String("tls-domain", "", "Domain name for Let's Encrypt (letsencrypt mode)")
+	tlsCache := flag.String("tls-cache", "./cert-cache", "Directory to cache Let's Encrypt certs")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
 
@@ -594,8 +736,13 @@ func main() {
 		os.Exit(0)
 	}
 
+	tlsConf, err := buildTLSConfig(*tlsMode, *tlsCert, *tlsKey, *tlsDomain, *tlsCache)
+	if err != nil {
+		log.Fatalf("TLS setup: %v", err)
+	}
+
 	addr := fmt.Sprintf("%s:%d", *bind, *port)
-	server, err := NewServer(addr, *ipv6, *maxClients, *authPath)
+	server, err := NewServer(addr, *agentPath, *authPath, *maxClients, tlsConf, *webroot)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}

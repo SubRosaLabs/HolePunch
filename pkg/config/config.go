@@ -36,7 +36,7 @@ func StdinIsTTY() bool {
 
 // Defaults
 const (
-	DefaultServerPort     = 41234
+	DefaultServerPort     = 443
 	DefaultSOCKS5Port     = 1080
 	DefaultKeepalive      = 25 * time.Second
 	DefaultConnectTimeout = 10 * time.Second

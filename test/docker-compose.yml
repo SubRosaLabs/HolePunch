@@ -19,7 +19,7 @@ services:
     build:
       context: ..
       dockerfile: test/Dockerfile
-    command: ["holepunch-server", "-authorized-keys", "/keys/authorized_keys"]
+    command: ["holepunch-server", "-authorized-keys", "/keys/authorized_keys", "-tls-mode", "self"]
     volumes:
       - ./authorized_keys:/keys/authorized_keys:ro
     networks:
@@ -32,7 +32,7 @@ services:
     build:
       context: ..
       dockerfile: test/Dockerfile
-    command: ["holepunch-client", "-server", "orchestrator:41234"]
+    command: ["holepunch-client", "-server", "orchestrator:443", "-ignorecert"]
     networks:
       - punchnet
       - orgnet
@@ -74,7 +74,7 @@ services:
       dockerfile: test/Dockerfile
     command: ["/bin/bash", "/scripts/operator.sh"]
     environment:
-      ORCHESTRATOR: "orchestrator:41234"
+      ORCHESTRATOR: "orchestrator:443"
       MYBOX2: "mybox2"
     cap_add:
       - NET_ADMIN
