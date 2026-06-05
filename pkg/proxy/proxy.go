@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,13 @@ const (
 	PacketTypeTCPError      PacketType = 24 // TCP connection error
 	PacketTypeUDPData       PacketType = 25 // UDP datagram
 	PacketTypeIPPacket      PacketType = 30 // Raw IP packet for TUN mode
+
+	// Reverse listener: operator asks agent to bind a port; inbound connections
+	// are reverse-proxied back through the tunnel to the operator's local dest.
+	PacketTypeReverseBindRequest PacketType = 40 // Operator→Agent: bind port, StreamID=bindPort, DstAddr=operatorDest
+	PacketTypeReverseBindAck     PacketType = 41 // Agent→Operator: ack/error, StreamID=bindPort, Payload=err or empty
+	PacketTypeReverseOpen        PacketType = 42 // Agent→Operator: inbound arrived, StreamID=streamID, DstAddr=operatorDest
+	PacketTypeReverseUnbind      PacketType = 43 // Operator→Agent: stop listening, StreamID=bindPort
 )
 
 // ProxyPacket represents a proxy protocol packet.
@@ -91,7 +99,7 @@ func ParseProxyPacket(data []byte) (*ProxyPacket, error) {
 	return p, nil
 }
 
-// IsProxyPacket checks if data is a proxy packet (TCP/UDP stream or raw IP)
+// IsProxyPacket checks if data is a proxy packet (TCP/UDP stream, raw IP, or reverse listener control)
 func IsProxyPacket(data []byte) bool {
 	if len(data) < 1 {
 		return false
@@ -100,7 +108,10 @@ func IsProxyPacket(data []byte) bool {
 	if pktType >= PacketTypeTCPConnect && pktType <= PacketTypeUDPData {
 		return true
 	}
-	return pktType == PacketTypeIPPacket
+	if pktType == PacketTypeIPPacket {
+		return true
+	}
+	return pktType >= PacketTypeReverseBindRequest && pktType <= PacketTypeReverseUnbind
 }
 
 // TCPStream represents an active TCP stream.
@@ -239,7 +250,13 @@ type Manager struct {
 	streamID  uint32
 	tunConns  map[string]*TUNConn // key: "srcIP:srcPort-dstIP:dstPort"
 	tunWriter func([]byte)        // Function to write packets back to TUN
-	mu        sync.RWMutex
+
+	// Reverse listener state
+	reverseListeners map[int]*ReverseListener    // agent side: active bound ports
+	reverseForwards  map[int]*ReversePortForward // operator side: tracking for list/del
+	pendingBinds     map[int]chan error           // operator side: waiting for ReverseBindAck
+
+	mu sync.RWMutex
 }
 
 // PortForward represents a local port forwarding rule
@@ -249,16 +266,40 @@ type PortForward struct {
 	PeerID     [32]byte
 	listener   net.Listener
 	manager    *Manager
-	running    bool
+	running    atomic.Bool
+}
+
+// ReverseListener is the agent-side binding created by a ReverseBindRequest.
+// It listens on 0.0.0.0:BindPort and for each inbound connection sends a
+// ReverseOpen to the operator, which then connects to DestAddr locally.
+type ReverseListener struct {
+	BindPort int
+	DestAddr string   // operator-local address to connect to on each inbound
+	PeerID   [32]byte // operator peer to notify
+	listener net.Listener
+	manager  *Manager
+	running  atomic.Bool
+}
+
+// ReversePortForward is the operator-side record of an outstanding reverse
+// listener request. Stored for listing; the actual per-connection handling
+// is driven by inbound ReverseOpen packets.
+type ReversePortForward struct {
+	BindPort int
+	DestAddr string   // operator-local address
+	PeerID   [32]byte // agent peer
 }
 
 // NewManager creates a new proxy manager
 func NewManager(sendFunc func(peerID [32]byte, data []byte) error) *Manager {
 	return &Manager{
-		sendFunc:  sendFunc,
-		streams:   make(map[uint32]*TCPStream),
-		listeners: make(map[int]*PortForward),
-		tunConns:  make(map[string]*TUNConn),
+		sendFunc:         sendFunc,
+		streams:          make(map[uint32]*TCPStream),
+		listeners:        make(map[int]*PortForward),
+		tunConns:         make(map[string]*TUNConn),
+		reverseListeners: make(map[int]*ReverseListener),
+		reverseForwards:  make(map[int]*ReversePortForward),
+		pendingBinds:     make(map[int]chan error),
 	}
 }
 
@@ -290,8 +331,8 @@ func (m *Manager) AddPortForward(localPort int, remoteAddr string, peerID [32]by
 		PeerID:     peerID,
 		listener:   listener,
 		manager:    m,
-		running:    true,
 	}
+	pf.running.Store(true)
 
 	m.mu.Lock()
 	m.listeners[localPort] = pf
@@ -313,7 +354,7 @@ func (m *Manager) RemovePortForward(localPort int) {
 	m.mu.Unlock()
 
 	if ok && pf != nil {
-		pf.running = false
+		pf.running.Store(false)
 		pf.listener.Close()
 	}
 }
@@ -331,10 +372,10 @@ func (m *Manager) ListPortForwards() []*PortForward {
 }
 
 func (pf *PortForward) acceptLoop() {
-	for pf.running {
+	for pf.running.Load() {
 		conn, err := pf.listener.Accept()
 		if err != nil {
-			if pf.running {
+			if pf.running.Load() {
 				log.Printf("Accept error: %v", err)
 			}
 			continue
@@ -406,32 +447,32 @@ func (m *Manager) readFromLocal(stream *TCPStream) {
 		}
 		stream.mu.Unlock()
 
-		n, err := stream.Conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				// Send close to peer
-				packet := &ProxyPacket{
-					Type:     PacketTypeTCPClose,
-					StreamID: stream.ID,
-					DstAddr:  stream.DstAddr,
-				}
-				m.sendFunc(stream.PeerID, packet.Serialize())
+		n, readErr := stream.Conn.Read(buf)
+
+		// Send any data first — Read may return (n, io.EOF) for the last chunk.
+		if n > 0 {
+			packet := &ProxyPacket{
+				Type:     PacketTypeTCPData,
+				StreamID: stream.ID,
+				Seq:      stream.nextSendSeq(),
+				DstAddr:  stream.DstAddr,
+				Payload:  buf[:n],
 			}
-			m.closeStream(stream.ID)
-			return
+			if err := m.sendFunc(stream.PeerID, packet.Serialize()); err != nil {
+				log.Printf("Failed to send data: %v", err)
+				m.closeStream(stream.ID)
+				return
+			}
 		}
 
-		// Send data to peer with monotonically increasing Seq for reassembly.
-		packet := &ProxyPacket{
-			Type:     PacketTypeTCPData,
-			StreamID: stream.ID,
-			Seq:      stream.nextSendSeq(),
-			DstAddr:  stream.DstAddr,
-			Payload:  buf[:n],
-		}
-
-		if err := m.sendFunc(stream.PeerID, packet.Serialize()); err != nil {
-			log.Printf("Failed to send data: %v", err)
+		if readErr != nil {
+			// Always forward close (EOF = graceful FIN; other = error).
+			pkt := &ProxyPacket{
+				Type:     PacketTypeTCPClose,
+				StreamID: stream.ID,
+				DstAddr:  stream.DstAddr,
+			}
+			m.sendFunc(stream.PeerID, pkt.Serialize())
 			m.closeStream(stream.ID)
 			return
 		}
@@ -483,57 +524,80 @@ func (m *Manager) HandlePacket(peerID [32]byte, data []byte) error {
 		return m.handleTCPClose(packet)
 	case PacketTypeTCPError:
 		return m.handleTCPError(packet)
+	case PacketTypeReverseBindRequest:
+		return m.handleReverseBindRequest(peerID, packet)
+	case PacketTypeReverseBindAck:
+		return m.handleReverseBindAck(packet)
+	case PacketTypeReverseOpen:
+		return m.handleReverseOpen(peerID, packet)
+	case PacketTypeReverseUnbind:
+		return m.handleReverseUnbind(packet)
 	}
 
 	return nil
 }
 
 func (m *Manager) handleTCPConnect(peerID [32]byte, packet *ProxyPacket) error {
-	// Peer wants us to connect to a destination
 	log.Printf("TCP connect request: stream %d -> %s", packet.StreamID, packet.DstAddr)
 
-	conn, err := net.DialTimeout("tcp", packet.DstAddr, streamDialTimeout)
-	if err != nil {
-		log.Printf("TCP connect failed: %s: %v", packet.DstAddr, err)
-		// Send error response
-		errPacket := &ProxyPacket{
-			Type:     PacketTypeTCPError,
-			StreamID: packet.StreamID,
-			DstAddr:  packet.DstAddr,
-			Payload:  []byte(err.Error()),
-		}
-		return m.sendFunc(peerID, errPacket.Serialize())
-	}
-
-	stream := &TCPStream{
-		ID:      packet.StreamID,
-		Conn:    conn,
-		PeerID:  peerID,
-		DstAddr: packet.DstAddr,
-		Ready:   make(chan struct{}),
-	}
-
+	// Guard against duplicate connect requests for the same stream ID before
+	// the first dial completes.
 	m.mu.Lock()
-	m.streams[packet.StreamID] = stream
+	if _, exists := m.streams[packet.StreamID]; exists {
+		m.mu.Unlock()
+		return nil
+	}
+	// Reserve the slot with a placeholder so concurrent packets don't double-dial.
+	m.streams[packet.StreamID] = nil
 	m.mu.Unlock()
 
-	// Send ack
-	ackPacket := &ProxyPacket{
-		Type:     PacketTypeTCPConnectAck,
-		StreamID: packet.StreamID,
-		DstAddr:  packet.DstAddr,
-	}
+	// Dial on a goroutine so we don't block the receive loop (and stall all
+	// other streams) for up to streamDialTimeout on every new connection.
+	streamID := packet.StreamID
+	dstAddr := packet.DstAddr
+	go func() {
+		conn, err := net.DialTimeout("tcp", dstAddr, streamDialTimeout)
+		if err != nil {
+			log.Printf("TCP connect failed: %s: %v", dstAddr, err)
+			m.mu.Lock()
+			delete(m.streams, streamID)
+			m.mu.Unlock()
+			errPacket := &ProxyPacket{
+				Type:     PacketTypeTCPError,
+				StreamID: streamID,
+				DstAddr:  dstAddr,
+				Payload:  []byte(err.Error()),
+			}
+			m.sendFunc(peerID, errPacket.Serialize())
+			return
+		}
 
-	if err := m.sendFunc(peerID, ackPacket.Serialize()); err != nil {
-		conn.Close()
-		m.removeStream(packet.StreamID)
-		return err
-	}
+		stream := &TCPStream{
+			ID:      streamID,
+			Conn:    conn,
+			PeerID:  peerID,
+			DstAddr: dstAddr,
+			Ready:   make(chan struct{}),
+		}
 
-	log.Printf("TCP tunnel: connected to %s (stream %d)", packet.DstAddr, packet.StreamID)
+		m.mu.Lock()
+		m.streams[streamID] = stream
+		m.mu.Unlock()
 
-	// Start reading from remote connection
-	go m.readFromRemote(stream)
+		ackPacket := &ProxyPacket{
+			Type:     PacketTypeTCPConnectAck,
+			StreamID: streamID,
+			DstAddr:  dstAddr,
+		}
+		if err := m.sendFunc(peerID, ackPacket.Serialize()); err != nil {
+			conn.Close()
+			m.removeStream(streamID)
+			return
+		}
+
+		log.Printf("TCP tunnel: connected to %s (stream %d)", dstAddr, streamID)
+		go m.readFromRemote(stream)
+	}()
 
 	return nil
 }
@@ -549,29 +613,30 @@ func (m *Manager) readFromRemote(stream *TCPStream) {
 		}
 		stream.mu.Unlock()
 
-		n, err := stream.Conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				packet := &ProxyPacket{
-					Type:     PacketTypeTCPClose,
-					StreamID: stream.ID,
-					DstAddr:  stream.DstAddr,
-				}
-				m.sendFunc(stream.PeerID, packet.Serialize())
+		n, readErr := stream.Conn.Read(buf)
+
+		// Send data before checking the error — Read may return (n, io.EOF).
+		if n > 0 {
+			packet := &ProxyPacket{
+				Type:     PacketTypeTCPData,
+				StreamID: stream.ID,
+				Seq:      stream.nextSendSeq(),
+				DstAddr:  stream.DstAddr,
+				Payload:  buf[:n],
 			}
-			m.closeStream(stream.ID)
-			return
+			if err := m.sendFunc(stream.PeerID, packet.Serialize()); err != nil {
+				m.closeStream(stream.ID)
+				return
+			}
 		}
 
-		packet := &ProxyPacket{
-			Type:     PacketTypeTCPData,
-			StreamID: stream.ID,
-			Seq:      stream.nextSendSeq(),
-			DstAddr:  stream.DstAddr,
-			Payload:  buf[:n],
-		}
-
-		if err := m.sendFunc(stream.PeerID, packet.Serialize()); err != nil {
+		if readErr != nil {
+			pkt := &ProxyPacket{
+				Type:     PacketTypeTCPClose,
+				StreamID: stream.ID,
+				DstAddr:  stream.DstAddr,
+			}
+			m.sendFunc(stream.PeerID, pkt.Serialize())
 			m.closeStream(stream.ID)
 			return
 		}
@@ -641,7 +706,7 @@ type SOCKS5Server struct {
 	listener net.Listener
 	manager  *Manager
 	peerID   [32]byte
-	running  bool
+	running  atomic.Bool
 	port     int
 }
 
@@ -656,9 +721,9 @@ func (m *Manager) StartSOCKS5(port int, peerID [32]byte) error {
 		listener: listener,
 		manager:  m,
 		peerID:   peerID,
-		running:  true,
 		port:     port,
 	}
+	m.socks5.running.Store(true)
 
 	go m.socks5.acceptLoop()
 
@@ -669,7 +734,7 @@ func (m *Manager) StartSOCKS5(port int, peerID [32]byte) error {
 // StopSOCKS5 stops the SOCKS5 server
 func (m *Manager) StopSOCKS5() {
 	if m.socks5 != nil {
-		m.socks5.running = false
+		m.socks5.running.Store(false)
 		m.socks5.listener.Close()
 		m.socks5 = nil
 	}
@@ -684,10 +749,10 @@ func (m *Manager) GetSOCKS5Port() int {
 }
 
 func (s *SOCKS5Server) acceptLoop() {
-	for s.running {
+	for s.running.Load() {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			if s.running {
+			if s.running.Load() {
 				log.Printf("SOCKS5 accept error: %v", err)
 			}
 			continue
@@ -697,33 +762,46 @@ func (s *SOCKS5Server) acceptLoop() {
 	}
 }
 
-func (s *SOCKS5Server) handleClient(conn net.Conn) {
-	// SOCKS5 handshake
-	buf := make([]byte, 256)
+// readFull reads exactly n bytes from r, returning an error on short read.
+func readFull(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
 
-	// Read version and auth methods
-	n, err := conn.Read(buf)
-	if err != nil || n < 2 {
+func (s *SOCKS5Server) handleClient(conn net.Conn) {
+	defer func() {
+		// conn.Close() is called explicitly on error paths; this catches panics.
+		if r := recover(); r != nil {
+			conn.Close()
+		}
+	}()
+
+	// ── Greeting ────────────────────────────────────────────────────────────
+	// VER(1) + NMETHODS(1)
+	hdr, err := readFull(conn, 2)
+	if err != nil || hdr[0] != 0x05 {
 		conn.Close()
 		return
 	}
-
-	if buf[0] != 0x05 {
-		conn.Close()
-		return // Not SOCKS5
+	nMethods := int(hdr[1])
+	if nMethods > 0 {
+		if _, err := readFull(conn, nMethods); err != nil {
+			conn.Close()
+			return
+		}
 	}
-
 	// No auth required
 	conn.Write([]byte{0x05, 0x00})
 
-	// Read connect request
-	n, err = conn.Read(buf)
-	if err != nil || n < 7 {
+	// ── Request ──────────────────────────────────────────────────────────────
+	// VER(1) + CMD(1) + RSV(1) + ATYP(1)
+	req, err := readFull(conn, 4)
+	if err != nil {
 		conn.Close()
 		return
 	}
-
-	if buf[0] != 0x05 || buf[1] != 0x01 {
+	if req[0] != 0x05 || req[1] != 0x01 {
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		conn.Close()
 		return
@@ -731,33 +809,41 @@ func (s *SOCKS5Server) handleClient(conn net.Conn) {
 
 	var dstAddr string
 
-	switch buf[3] {
+	switch req[3] {
 	case 0x01: // IPv4
-		if n < 10 {
+		addr, err := readFull(conn, 4+2)
+		if err != nil {
 			conn.Close()
 			return
 		}
-		ip := net.IP(buf[4:8])
-		port := binary.BigEndian.Uint16(buf[8:10])
+		ip := net.IP(addr[:4])
+		port := binary.BigEndian.Uint16(addr[4:6])
 		dstAddr = fmt.Sprintf("%s:%d", ip.String(), port)
 
 	case 0x03: // Domain
-		domainLen := int(buf[4])
-		if n < 5+domainLen+2 {
+		lenBuf, err := readFull(conn, 1)
+		if err != nil {
 			conn.Close()
 			return
 		}
-		domain := string(buf[5 : 5+domainLen])
-		port := binary.BigEndian.Uint16(buf[5+domainLen : 7+domainLen])
+		domainLen := int(lenBuf[0])
+		rest, err := readFull(conn, domainLen+2)
+		if err != nil {
+			conn.Close()
+			return
+		}
+		domain := string(rest[:domainLen])
+		port := binary.BigEndian.Uint16(rest[domainLen : domainLen+2])
 		dstAddr = fmt.Sprintf("%s:%d", domain, port)
 
 	case 0x04: // IPv6
-		if n < 22 {
+		addr, err := readFull(conn, 16+2)
+		if err != nil {
 			conn.Close()
 			return
 		}
-		ip := net.IP(buf[4:20])
-		port := binary.BigEndian.Uint16(buf[20:22])
+		ip := net.IP(addr[:16])
+		port := binary.BigEndian.Uint16(addr[16:18])
 		dstAddr = fmt.Sprintf("[%s]:%d", ip.String(), port)
 
 	default:
@@ -829,25 +915,317 @@ func (m *Manager) Close() {
 
 	m.mu.Lock()
 	for port, pf := range m.listeners {
-		pf.running = false
+		pf.running.Store(false)
 		pf.listener.Close()
 		delete(m.listeners, port)
 	}
 
 	for id, stream := range m.streams {
 		stream.closed = true
-		stream.Conn.Close()
+		if stream.Conn != nil {
+			stream.Conn.Close()
+		}
 		delete(m.streams, id)
 	}
 
-	// Close TUN connections
 	for key, tc := range m.tunConns {
 		if tc.Conn != nil {
 			tc.Conn.Close()
 		}
 		delete(m.tunConns, key)
 	}
+
+	for port, rl := range m.reverseListeners {
+		rl.running.Store(false)
+		rl.listener.Close()
+		delete(m.reverseListeners, port)
+	}
 	m.mu.Unlock()
+}
+
+// ── Reverse listener: operator-side API ────────────────────────────────────
+
+// AddReversePortForward sends a ReverseBindRequest to the agent and blocks
+// until the agent confirms the port is bound (or returns an error/timeout).
+func (m *Manager) AddReversePortForward(bindPort int, destAddr string, peerID [32]byte) error {
+	done := make(chan error, 1)
+
+	m.mu.Lock()
+	if _, exists := m.reverseForwards[bindPort]; exists {
+		m.mu.Unlock()
+		return fmt.Errorf("reverse listener on port %d already exists", bindPort)
+	}
+	m.pendingBinds[bindPort] = done
+	m.reverseForwards[bindPort] = &ReversePortForward{
+		BindPort: bindPort,
+		DestAddr: destAddr,
+		PeerID:   peerID,
+	}
+	m.mu.Unlock()
+
+	pkt := &ProxyPacket{
+		Type:     PacketTypeReverseBindRequest,
+		StreamID: uint32(bindPort),
+		DstAddr:  destAddr,
+	}
+	if err := m.sendFunc(peerID, pkt.Serialize()); err != nil {
+		m.mu.Lock()
+		delete(m.pendingBinds, bindPort)
+		delete(m.reverseForwards, bindPort)
+		m.mu.Unlock()
+		return err
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			m.mu.Lock()
+			delete(m.reverseForwards, bindPort)
+			m.mu.Unlock()
+			return err
+		}
+		return nil
+	case <-time.After(10 * time.Second):
+		m.mu.Lock()
+		delete(m.pendingBinds, bindPort)
+		delete(m.reverseForwards, bindPort)
+		m.mu.Unlock()
+		return fmt.Errorf("timeout waiting for agent to bind port %d", bindPort)
+	}
+}
+
+// RemoveReversePortForward tells the agent to stop its reverse listener.
+func (m *Manager) RemoveReversePortForward(bindPort int) error {
+	m.mu.Lock()
+	pf, ok := m.reverseForwards[bindPort]
+	if ok {
+		delete(m.reverseForwards, bindPort)
+	}
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("no reverse listener on port %d", bindPort)
+	}
+
+	pkt := &ProxyPacket{
+		Type:     PacketTypeReverseUnbind,
+		StreamID: uint32(bindPort),
+	}
+	return m.sendFunc(pf.PeerID, pkt.Serialize())
+}
+
+// ListReversePortForwards returns active reverse port forwards (operator side).
+func (m *Manager) ListReversePortForwards() []*ReversePortForward {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*ReversePortForward, 0, len(m.reverseForwards))
+	for _, pf := range m.reverseForwards {
+		out = append(out, pf)
+	}
+	return out
+}
+
+// handleReverseBindAck is called on the operator when the agent confirms (or
+// rejects) the bind request.
+func (m *Manager) handleReverseBindAck(packet *ProxyPacket) error {
+	bindPort := int(packet.StreamID)
+
+	m.mu.Lock()
+	done, ok := m.pendingBinds[bindPort]
+	if ok {
+		delete(m.pendingBinds, bindPort)
+	}
+	m.mu.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	if len(packet.Payload) > 0 {
+		done <- fmt.Errorf("%s", string(packet.Payload))
+	} else {
+		done <- nil
+	}
+	return nil
+}
+
+// handleReverseOpen is called on the operator when the agent has received an
+// inbound connection and wants the operator to connect to its local destAddr.
+// Dial runs on a goroutine to avoid blocking the receive loop.
+func (m *Manager) handleReverseOpen(peerID [32]byte, packet *ProxyPacket) error {
+	log.Printf("Reverse open: stream %d, connecting to %s", packet.StreamID, packet.DstAddr)
+	streamID := packet.StreamID
+	dstAddr := packet.DstAddr
+	go func() {
+		conn, err := net.DialTimeout("tcp", dstAddr, streamDialTimeout)
+		if err != nil {
+			log.Printf("Reverse open: dial %s failed: %v", dstAddr, err)
+			errPkt := &ProxyPacket{
+				Type:     PacketTypeTCPError,
+				StreamID: streamID,
+				DstAddr:  dstAddr,
+				Payload:  []byte(err.Error()),
+			}
+			m.sendFunc(peerID, errPkt.Serialize())
+			return
+		}
+
+		stream := &TCPStream{
+			ID:      streamID,
+			Conn:    conn,
+			PeerID:  peerID,
+			DstAddr: dstAddr,
+			Ready:   make(chan struct{}),
+		}
+
+		m.mu.Lock()
+		m.streams[streamID] = stream
+		m.mu.Unlock()
+
+		ack := &ProxyPacket{
+			Type:     PacketTypeTCPConnectAck,
+			StreamID: streamID,
+			DstAddr:  dstAddr,
+		}
+		if err := m.sendFunc(peerID, ack.Serialize()); err != nil {
+			conn.Close()
+			m.removeStream(streamID)
+			return
+		}
+
+		log.Printf("Reverse tunnel: connected to %s (stream %d)", dstAddr, streamID)
+		go m.readFromRemote(stream)
+	}()
+	return nil
+}
+
+// ── Reverse listener: agent-side ──────────────────────────────────────────
+
+// handleReverseBindRequest is called on the agent when the operator asks it
+// to bind a port and reverse-proxy inbound connections.
+func (m *Manager) handleReverseBindRequest(peerID [32]byte, packet *ProxyPacket) error {
+	bindPort := int(packet.StreamID)
+	destAddr := packet.DstAddr
+
+	if err := m.addReverseListener(bindPort, destAddr, peerID); err != nil {
+		ack := &ProxyPacket{
+			Type:     PacketTypeReverseBindAck,
+			StreamID: uint32(bindPort),
+			Payload:  []byte(err.Error()),
+		}
+		return m.sendFunc(peerID, ack.Serialize())
+	}
+
+	ack := &ProxyPacket{
+		Type:     PacketTypeReverseBindAck,
+		StreamID: uint32(bindPort),
+	}
+	return m.sendFunc(peerID, ack.Serialize())
+}
+
+// handleReverseUnbind stops the agent's reverse listener for a bind port.
+func (m *Manager) handleReverseUnbind(packet *ProxyPacket) error {
+	bindPort := int(packet.StreamID)
+	m.mu.Lock()
+	rl, ok := m.reverseListeners[bindPort]
+	if ok {
+		delete(m.reverseListeners, bindPort)
+	}
+	m.mu.Unlock()
+
+	if ok && rl != nil {
+		rl.running.Store(false)
+		rl.listener.Close()
+		log.Printf("Reverse listener removed: 0.0.0.0:%d", bindPort)
+	}
+	return nil
+}
+
+// addReverseListener binds a port on the agent and starts its accept loop.
+func (m *Manager) addReverseListener(bindPort int, destAddr string, peerID [32]byte) error {
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", bindPort))
+	if err != nil {
+		return fmt.Errorf("failed to bind port %d: %w", bindPort, err)
+	}
+
+	rl := &ReverseListener{
+		BindPort: bindPort,
+		DestAddr: destAddr,
+		PeerID:   peerID,
+		listener: ln,
+		manager:  m,
+	}
+	rl.running.Store(true)
+
+	m.mu.Lock()
+	m.reverseListeners[bindPort] = rl
+	m.mu.Unlock()
+
+	go rl.acceptLoop()
+
+	log.Printf("Reverse listener: 0.0.0.0:%d (operator will connect to %s on inbound)", bindPort, destAddr)
+	return nil
+}
+
+func (rl *ReverseListener) acceptLoop() {
+	for rl.running.Load() {
+		conn, err := rl.listener.Accept()
+		if err != nil {
+			if rl.running.Load() {
+				log.Printf("Reverse listener accept error: %v", err)
+			}
+			continue
+		}
+		go rl.handleInbound(conn)
+	}
+}
+
+func (rl *ReverseListener) handleInbound(conn net.Conn) {
+	streamID := rl.manager.nextStreamID()
+
+	stream := &TCPStream{
+		ID:      streamID,
+		Conn:    conn,
+		PeerID:  rl.PeerID,
+		DstAddr: rl.DestAddr,
+		Ready:   make(chan struct{}),
+	}
+
+	rl.manager.mu.Lock()
+	rl.manager.streams[streamID] = stream
+	rl.manager.mu.Unlock()
+
+	pkt := &ProxyPacket{
+		Type:     PacketTypeReverseOpen,
+		StreamID: streamID,
+		DstAddr:  rl.DestAddr,
+	}
+	if err := rl.manager.sendFunc(rl.PeerID, pkt.Serialize()); err != nil {
+		log.Printf("Reverse listener: failed to send ReverseOpen: %v", err)
+		conn.Close()
+		rl.manager.removeStream(streamID)
+		return
+	}
+
+	select {
+	case <-stream.Ready:
+		if stream.Error != nil {
+			log.Printf("Reverse open failed for stream %d: %v", streamID, stream.Error)
+			conn.Close()
+			rl.manager.removeStream(streamID)
+			return
+		}
+	case <-time.After(10 * time.Second):
+		log.Printf("Reverse open timeout for stream %d", streamID)
+		conn.Close()
+		rl.manager.removeStream(streamID)
+		// Tell operator to release its side (it may already have dialed destAddr).
+		closePkt := &ProxyPacket{Type: PacketTypeTCPClose, StreamID: streamID}
+		rl.manager.sendFunc(rl.PeerID, closePkt.Serialize())
+		return
+	}
+
+	go rl.manager.readFromLocal(stream)
 }
 
 // SendIPPacket sends a raw IP packet to a peer (for TUN mode on operator)
