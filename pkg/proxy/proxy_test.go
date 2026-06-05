@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -52,11 +54,16 @@ func TestIsProxyPacket(t *testing.T) {
 	}{
 		{[]byte{byte(PacketTypeTCPConnect)}, true},
 		{[]byte{byte(PacketTypeTCPData)}, true},
-		{[]byte{byte(PacketTypeIPPacket)}, true}, // IP packets routed through HandlePacket
+		{[]byte{byte(PacketTypeIPPacket)}, true},
 		{[]byte{byte(PacketTypeUDPData)}, true},
-		{[]byte{0}, false},   // Invalid type
-		{[]byte{100}, false}, // Invalid type
-		{[]byte{}, false},    // Empty
+		// Reverse listener control packets
+		{[]byte{byte(PacketTypeReverseBindRequest)}, true},
+		{[]byte{byte(PacketTypeReverseBindAck)}, true},
+		{[]byte{byte(PacketTypeReverseOpen)}, true},
+		{[]byte{byte(PacketTypeReverseUnbind)}, true},
+		{[]byte{0}, false},
+		{[]byte{100}, false},
+		{[]byte{}, false},
 	}
 
 	for _, tc := range testCases {
@@ -68,12 +75,17 @@ func TestIsProxyPacket(t *testing.T) {
 }
 
 func TestProxyPacketTypes(t *testing.T) {
-	// Verify packet type constants are in expected ranges
 	if PacketTypeTCPConnect < 20 || PacketTypeTCPConnect > 30 {
 		t.Error("PacketTypeTCPConnect out of range")
 	}
 	if PacketTypeIPPacket != 30 {
 		t.Errorf("PacketTypeIPPacket should be 30, got %d", PacketTypeIPPacket)
+	}
+	if PacketTypeReverseBindRequest != 40 {
+		t.Errorf("PacketTypeReverseBindRequest should be 40, got %d", PacketTypeReverseBindRequest)
+	}
+	if PacketTypeReverseUnbind != 43 {
+		t.Errorf("PacketTypeReverseUnbind should be 43, got %d", PacketTypeReverseUnbind)
 	}
 }
 
@@ -308,5 +320,319 @@ func TestIPPacketParsing(t *testing.T) {
 	protocol := ipPacket[9]
 	if protocol != 6 {
 		t.Errorf("Expected TCP (6), got %d", protocol)
+	}
+}
+
+// ── EOF propagation ────────────────────────────────────────────────────────
+
+// TestEOFForwardedToOperator verifies that when the remote server closes its
+// connection (EOF), the operator receives a TCPClose so the browser's local
+// connection can be torn down promptly (the "visual elements not loading" fix).
+func TestEOFForwardedToOperator(t *testing.T) {
+	// Set up a real TCP server that sends data then closes.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c.Write([]byte("hello"))
+		c.Close() // graceful EOF
+	}()
+
+	var sentPkts []PacketType
+	var mu sync.Mutex
+	sendFunc := func(_ [32]byte, data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		mu.Lock()
+		sentPkts = append(sentPkts, PacketType(data[0]))
+		mu.Unlock()
+		return nil
+	}
+
+	m := NewManager(sendFunc)
+	var peerID [32]byte
+
+	// Create a stream whose Conn points at the test server.
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := &TCPStream{
+		ID:      1,
+		Conn:    conn,
+		PeerID:  peerID,
+		DstAddr: ln.Addr().String(),
+		Ready:   make(chan struct{}),
+	}
+	m.mu.Lock()
+	m.streams[1] = stream
+	m.mu.Unlock()
+
+	// readFromRemote should send TCPData then TCPClose.
+	go m.readFromRemote(stream)
+
+	<-serverDone
+	// Give the goroutine time to process EOF and send the close packet.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(sentPkts) == 0 {
+		t.Fatal("no packets sent")
+	}
+	last := sentPkts[len(sentPkts)-1]
+	if last != PacketTypeTCPClose {
+		t.Errorf("last packet should be TCPClose after EOF, got %d", last)
+	}
+}
+
+// ── Concurrent dials don't block each other ────────────────────────────────
+
+// TestConcurrentTCPConnect verifies that N simultaneous TCPConnect packets are
+// all handled without blocking each other — the critical fix for web pages
+// whose many resources previously queued behind a single slow dial.
+func TestConcurrentTCPConnect(t *testing.T) {
+	const N = 10
+
+	// N echo servers, one per stream.
+	addrs := make([]string, N)
+	for i := 0; i < N; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		addrs[i] = ln.Addr().String()
+		go func(l net.Listener) {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			io.Copy(c, c)
+			c.Close()
+		}(ln)
+	}
+
+	var acks sync.Map
+	sendFunc := func(_ [32]byte, data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		pkt, err := ParseProxyPacket(data)
+		if err != nil {
+			return nil
+		}
+		if pkt.Type == PacketTypeTCPConnectAck {
+			acks.Store(pkt.StreamID, true)
+		}
+		return nil
+	}
+
+	m := NewManager(sendFunc)
+	var peerID [32]byte
+
+	start := time.Now()
+	for i := 0; i < N; i++ {
+		pkt := &ProxyPacket{
+			Type:     PacketTypeTCPConnect,
+			StreamID: uint32(i + 1),
+			DstAddr:  addrs[i],
+		}
+		if err := m.HandlePacket(peerID, pkt.Serialize()); err != nil {
+			t.Fatalf("HandlePacket[%d]: %v", i, err)
+		}
+	}
+
+	// All N dials should complete well within 2s total (not N×dial_time).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		count := 0
+		acks.Range(func(_, _ any) bool { count++; return true })
+		if count == N {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	count := 0
+	acks.Range(func(_, _ any) bool { count++; return true })
+	if count != N {
+		t.Errorf("got %d/%d acks in %s", count, N, time.Since(start))
+	}
+}
+
+// ── Reverse listener packet round-trip ────────────────────────────────────
+
+// TestReverseListenerPacketFlow tests the full packet exchange for a reverse
+// listener: ReverseBindRequest → ReverseBindAck → ReverseOpen → TCPConnectAck.
+func TestReverseListenerPacketFlow(t *testing.T) {
+	// Set up a real local service the "operator" will connect to.
+	localSvc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localSvc.Close()
+	svcAddr := localSvc.Addr().String()
+
+	go func() {
+		c, err := localSvc.Accept()
+		if err != nil {
+			return
+		}
+		c.Write([]byte("svc_response"))
+		c.Close()
+	}()
+
+	// Agent manager: receives ReverseBindRequest, binds a port.
+	var agentSent []ProxyPacket
+	var agentMu sync.Mutex
+	agentSend := func(_ [32]byte, data []byte) error {
+		pkt, err := ParseProxyPacket(data)
+		if err != nil {
+			return nil
+		}
+		agentMu.Lock()
+		agentSent = append(agentSent, *pkt)
+		agentMu.Unlock()
+		return nil
+	}
+	agentMgr := NewManager(agentSend)
+	defer agentMgr.Close()
+
+	// Operator manager: receives ReverseBindAck and ReverseOpen, connects to svcAddr.
+	var operSent []ProxyPacket
+	var operMu sync.Mutex
+	operSend := func(_ [32]byte, data []byte) error {
+		pkt, err := ParseProxyPacket(data)
+		if err != nil {
+			return nil
+		}
+		operMu.Lock()
+		operSent = append(operSent, *pkt)
+		operMu.Unlock()
+		return nil
+	}
+	operMgr := NewManager(operSend)
+	defer operMgr.Close()
+
+	var peerID [32]byte
+
+	// Step 1: operator sends ReverseBindRequest to agent.
+	bindPort := 0 // will be overwritten; for test use a free port
+	ln0, _ := net.Listen("tcp", "127.0.0.1:0")
+	bindPort = ln0.Addr().(*net.TCPAddr).Port
+	ln0.Close()
+
+	go func() {
+		operMgr.AddReversePortForward(bindPort, svcAddr, peerID)
+	}()
+
+	// Wait for the ReverseBindRequest to be "sent" (captured in agentSend)
+	time.Sleep(50 * time.Millisecond)
+
+	// Find the ReverseBindRequest that the operator produced.
+	// In a real deployment operMgr.sendFunc delivers to the agent.
+	// Here we call agentMgr.HandlePacket directly.
+	bindReqPkt := &ProxyPacket{
+		Type:     PacketTypeReverseBindRequest,
+		StreamID: uint32(bindPort),
+		DstAddr:  svcAddr,
+	}
+	if err := agentMgr.HandlePacket(peerID, bindReqPkt.Serialize()); err != nil {
+		t.Fatalf("agent HandlePacket(ReverseBindRequest): %v", err)
+	}
+
+	// Agent should emit ReverseBindAck.
+	time.Sleep(100 * time.Millisecond)
+	agentMu.Lock()
+	var bindAck *ProxyPacket
+	for i := range agentSent {
+		if agentSent[i].Type == PacketTypeReverseBindAck {
+			bindAck = &agentSent[i]
+			break
+		}
+	}
+	agentMu.Unlock()
+
+	if bindAck == nil {
+		t.Fatal("agent did not send ReverseBindAck")
+	}
+	if len(bindAck.Payload) != 0 {
+		t.Fatalf("ReverseBindAck has error payload: %s", bindAck.Payload)
+	}
+
+	// Deliver ack to operator so AddReversePortForward unblocks.
+	if err := operMgr.HandlePacket(peerID, bindAck.Serialize()); err != nil {
+		t.Fatalf("operator HandlePacket(ReverseBindAck): %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Step 2: simulate an inbound connection to the agent's bound port.
+	inbound, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", bindPort))
+	if err != nil {
+		t.Fatalf("dial agent bind port: %v", err)
+	}
+	defer inbound.Close()
+
+	// Agent emits ReverseOpen.
+	time.Sleep(200 * time.Millisecond)
+	agentMu.Lock()
+	var revOpen *ProxyPacket
+	for i := range agentSent {
+		if agentSent[i].Type == PacketTypeReverseOpen {
+			revOpen = &agentSent[i]
+			break
+		}
+	}
+	agentMu.Unlock()
+
+	if revOpen == nil {
+		t.Fatal("agent did not send ReverseOpen")
+	}
+
+	// Step 3: operator handles ReverseOpen → connects to svcAddr → sends TCPConnectAck.
+	if err := operMgr.HandlePacket(peerID, revOpen.Serialize()); err != nil {
+		t.Fatalf("operator HandlePacket(ReverseOpen): %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	operMu.Lock()
+	var ack *ProxyPacket
+	for i := range operSent {
+		if operSent[i].Type == PacketTypeTCPConnectAck {
+			ack = &operSent[i]
+			break
+		}
+	}
+	operMu.Unlock()
+
+	if ack == nil {
+		t.Fatal("operator did not send TCPConnectAck after ReverseOpen")
+	}
+}
+
+// ── Manager new-field sanity ───────────────────────────────────────────────
+
+func TestManagerReverseFields(t *testing.T) {
+	m := NewManager(func(_ [32]byte, _ []byte) error { return nil })
+	if m.reverseListeners == nil {
+		t.Error("reverseListeners map not initialized")
+	}
+	if m.reverseForwards == nil {
+		t.Error("reverseForwards map not initialized")
+	}
+	if m.pendingBinds == nil {
+		t.Error("pendingBinds map not initialized")
 	}
 }

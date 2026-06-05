@@ -424,6 +424,10 @@ func (c *Client) interactiveMode() {
 			if c.requireOperator("listener") {
 				c.cmdListener(args[1:])
 			}
+		case "rlistener":
+			if c.requireOperator("rlistener") {
+				c.cmdRlistener(args[1:])
+			}
 		case "socks":
 			if c.requireOperator("socks") {
 				c.cmdSocks(args[1:])
@@ -480,9 +484,14 @@ Tunnel (Linux operator, requires sudo):
   ifconfig                    - Show tunnel info
 
 Listeners (no root needed):
-  listener add <local>:<remote> - Forward local port to remote via agent
-  listener del <port>           - Remove listener
-  listener list                 - Show listeners
+  listener add <local>:<remote>   - Forward local port to remote via agent
+  listener del <port>             - Remove listener
+  listener list                   - Show listeners
+
+Reverse listeners (agent binds, operator connects):
+  rlistener add <bind>:<dest>     - Agent binds port; inbound connects to your local dest
+  rlistener del <port>            - Stop agent's reverse listener
+  rlistener list                  - Show reverse listeners
 
 SOCKS (no root needed):
   socks start [port]          - Start SOCKS5 proxy (default: 1080)
@@ -961,6 +970,77 @@ func (c *Client) cmdListener(args []string) {
 		for _, f := range forwards {
 			fmt.Printf("  127.0.0.1:%d -> %s\n", f.LocalPort, f.RemoteAddr)
 		}
+	}
+}
+
+func (c *Client) cmdRlistener(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: rlistener add|del|list")
+		return
+	}
+
+	switch args[0] {
+	case "add":
+		if c.session == nil {
+			fmt.Println("Select session first: session <id>")
+			return
+		}
+		if len(args) < 2 {
+			fmt.Println("Usage: rlistener add <bind-port>:<dest-host:dest-port>")
+			fmt.Println("Example: rlistener add 445:127.0.0.1:445")
+			return
+		}
+		parts := strings.SplitN(args[1], ":", 2)
+		if len(parts) != 2 {
+			fmt.Println("Invalid format. Use: <bind-port>:<dest-host:dest-port>")
+			return
+		}
+		bindPort, err := strconv.Atoi(parts[0])
+		if err != nil {
+			fmt.Printf("Invalid port: %s\n", parts[0])
+			return
+		}
+		destAddr := parts[1]
+		fmt.Printf("Requesting agent to bind 0.0.0.0:%d...\n", bindPort)
+		if err := c.proxyManager.AddReversePortForward(bindPort, destAddr, c.session.ID); err != nil {
+			fmt.Printf("Failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Reverse listener: agent:0.0.0.0:%d -> %s\n", bindPort, destAddr)
+
+	case "del", "delete":
+		if c.session == nil {
+			fmt.Println("Select session first: session <id>")
+			return
+		}
+		if len(args) < 2 {
+			fmt.Println("Usage: rlistener del <port>")
+			return
+		}
+		port, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Printf("Invalid port: %s\n", args[1])
+			return
+		}
+		if err := c.proxyManager.RemoveReversePortForward(port); err != nil {
+			fmt.Printf("Failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Reverse listener removed: %d\n", port)
+
+	case "list":
+		fwds := c.proxyManager.ListReversePortForwards()
+		if len(fwds) == 0 {
+			fmt.Println("No reverse listeners")
+			return
+		}
+		fmt.Println("Reverse Listeners:")
+		for _, f := range fwds {
+			fmt.Printf("  agent:0.0.0.0:%d -> %s\n", f.BindPort, f.DestAddr)
+		}
+
+	default:
+		fmt.Println("Usage: rlistener add|del|list")
 	}
 }
 

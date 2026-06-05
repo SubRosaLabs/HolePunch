@@ -124,6 +124,33 @@ Listener: 127.0.0.1:2222 -> 192.168.1.10:22
 ssh -p 2222 user@localhost
 ```
 
+### Reverse listener (any OS, rootless)
+
+Expose a service running **on your operator box** through the agent. The agent
+binds a public port; inbound connections are tunneled back and land on a local
+address you specify. Useful for Responder, SMB relay, custom listeners, etc.
+
+```
+[HolePunch] >> rlistener add 445:127.0.0.1:445
+Requesting agent to bind 0.0.0.0:445...
+Reverse listener: agent:0.0.0.0:445 -> 127.0.0.1:445
+```
+
+Traffic flow:
+```
+External Box ──TCP──► Agent:445 ──tunnel──► Operator:127.0.0.1:445 ──► Your tool
+```
+
+Manage:
+```
+[HolePunch] >> rlistener list
+Reverse Listeners:
+  agent:0.0.0.0:445 -> 127.0.0.1:445
+
+[HolePunch] >> rlistener del 445
+Reverse listener removed: 445
+```
+
 ### TUN (Linux operator, sudo)
 
 Full L3 — run tools natively, no proxychains.
@@ -168,9 +195,13 @@ ifconfig                        Show interface + peer state
 socks start [port]              SOCKS5 proxy (default 1080)
 socks stop
 
-listener add <lp>:<host>:<rp>   Local port forward
+listener add <lp>:<host>:<rp>   Local port forward via agent
 listener del <port>
 listener list
+
+rlistener add <bp>:<host>:<rp>  Agent binds port, forwards inbound to operator
+rlistener del <port>
+rlistener list
 
 stats | version | help | quit
 ```

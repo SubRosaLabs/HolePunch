@@ -1,0 +1,91 @@
+networks:
+  # All containers that need to reach the orchestrator (the "internet-facing" path).
+  # OrgBox1 is here too so it can punch through; MyBox2 is here so OrgBox1 can
+  # dial it when forwarding the 445 connection.
+  punchnet:
+    driver: bridge
+
+  # Simulates the target org's internal network.  Only OrgBox1 and OrgBox2 are
+  # attached; MyBox1 has no route here, enforcing the network isolation.
+  orgnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24   # fixed so we can set up iptables rules in run_test.sh
+
+services:
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    command: ["holepunch-server", "-authorized-keys", "/keys/authorized_keys"]
+    volumes:
+      - ./authorized_keys:/keys/authorized_keys:ro
+    networks:
+      - punchnet
+
+  # Agent: sits inside the org.  Connects outbound to orchestrator via punchnet,
+  # and can reach OrgBox2 via orgnet.  Dials MyBox2 (punchnet) when the operator
+  # sets up a port-forward destination there.
+  orgbox1:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    command: ["holepunch-client", "-server", "orchestrator:41234"]
+    networks:
+      - punchnet
+      - orgnet
+    depends_on:
+      - orchestrator
+
+  # Simulated internal SMB target.  orgnet only — MyBox1 cannot reach it directly.
+  orgbox2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    command: ["python3", "/scripts/orgbox2_server.py"]
+    volumes:
+      - ./scripts:/scripts:ro
+    networks:
+      orgnet:
+        ipv4_address: 172.30.0.10   # fixed so run_test.sh can reference it
+
+  # Attacker-controlled receiver.  On punchnet so OrgBox1 can dial it when
+  # the operator's listener add points here.
+  mybox2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    command: ["python3", "/scripts/mybox2_server.py"]
+    volumes:
+      - ./scripts:/scripts:ro
+    networks:
+      - punchnet
+
+  # Operator box.  Runs the automation script that:
+  #   1. authenticates with the orchestrator
+  #   2. selects OrgBox1 as the session peer
+  #   3. adds: listener 445 -> mybox2:445
+  # NET_ADMIN is needed for the optional iptables intercept test in run_test.sh.
+  mybox1:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    command: ["/bin/bash", "/scripts/operator.sh"]
+    environment:
+      ORCHESTRATOR: "orchestrator:41234"
+      MYBOX2: "mybox2"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./keys:/keys:ro
+      - ./scripts:/scripts:ro
+    networks:
+      - punchnet
+    depends_on:
+      - orchestrator
+      - orgbox1
+      - mybox2
+      - orgbox2
+    stdin_open: true
