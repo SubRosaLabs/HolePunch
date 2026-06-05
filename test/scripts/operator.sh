@@ -20,7 +20,7 @@ echo "[mybox1] starting operator client..."
 # Start client with stdin from the FIFO; both stdout and stderr go to the log
 # file.  Because stdin is not a TTY, the interactive shell skips the prompt,
 # making the log clean to grep.
-holepunch-client -server "$ORCHESTRATOR" -key "$KEY" < "$PIPE" >"$LOG" 2>&1 &
+holepunch-client -server "$ORCHESTRATOR" -key "$KEY" -ignorecert < "$PIPE" >"$LOG" 2>&1 &
 HP_PID=$!
 
 # Hold the write end open so the FIFO never EOF's the client.
