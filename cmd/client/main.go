@@ -476,6 +476,9 @@ func (c *Client) handlePunchInit(data []byte) {
 		peer.Connected = true
 	}
 	c.peersMu.Unlock()
+
+	// Punch initiated — go dark on the orchestration channel immediately.
+	c.disconnectFromServer()
 }
 
 func (c *Client) onDataReceived(peerID [32]byte, data []byte) {
@@ -507,6 +510,22 @@ func (c *Client) onPeerConnected(peerID [32]byte) {
 		peer.Connected = true
 	}
 	c.peersMu.Unlock()
+
+	// P2P confirmed — sever the server connection so the host goes dark.
+	c.disconnectFromServer()
+}
+
+// disconnectFromServer closes the orchestration channel. Once P2P is live
+// there is no reason to keep reaching out to the server — all traffic is
+// now peer-to-peer only.
+func (c *Client) disconnectFromServer() {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+	if c.serverPipe != nil {
+		c.serverPipe.Close()
+		c.serverPipe = nil
+		log.Printf("Orchestrator disconnected — running peer-to-peer only")
+	}
 }
 
 func (c *Client) keepaliveLoop() {
