@@ -81,6 +81,7 @@ type Client struct {
 	tunnelRoutes  []string
 	tunFile       *os.File
 	isOperator    bool
+	peerConnected bool // set when any peer completes key exchange (covers agent role)
 }
 
 type PeerEntry struct {
@@ -234,6 +235,25 @@ func (c *Client) register() error {
 	return nil
 }
 
+// hasActivePeer returns true if at least one peer is connected (punch succeeded).
+func (c *Client) hasActivePeer() bool {
+	c.stateMu.RLock()
+	hasSession := c.session != nil
+	hasPeer := c.peerConnected
+	c.stateMu.RUnlock()
+	if hasSession || hasPeer {
+		return true
+	}
+	c.peersMu.RLock()
+	defer c.peersMu.RUnlock()
+	for _, p := range c.peers {
+		if p.Connected {
+			return true
+		}
+	}
+	return false
+}
+
 // serverReceiveLoop reads framed messages from the HTTP/3 response body.
 func (c *Client) serverReceiveLoop() {
 	for {
@@ -243,7 +263,14 @@ func (c *Client) serverReceiveLoop() {
 			case <-c.shutdown:
 			default:
 				log.Printf("Server connection closed: %v", err)
-				c.Shutdown()
+				if c.hasActivePeer() {
+					log.Printf("Active peer session present — continuing without orchestrator")
+					c.serverMu.Lock()
+					c.serverPipe = nil
+					c.serverMu.Unlock()
+				} else {
+					c.Shutdown()
+				}
 			}
 			return
 		}
@@ -440,6 +467,10 @@ func (c *Client) handlePunchInit(data []byte) {
 		log.Printf("Punch failed: %v", err)
 	}
 
+	c.stateMu.Lock()
+	c.peerConnected = true
+	c.stateMu.Unlock()
+
 	c.peersMu.Lock()
 	if peer, exists := c.peers[hexID]; exists {
 		peer.Connected = true
@@ -467,6 +498,10 @@ func (c *Client) onPeerConnected(peerID [32]byte) {
 	hexID := hex.EncodeToString(peerID[:8])
 	log.Printf("Agent connected: %s", hexID)
 
+	c.stateMu.Lock()
+	c.peerConnected = true
+	c.stateMu.Unlock()
+
 	c.peersMu.Lock()
 	if peer, exists := c.peers[hexID]; exists {
 		peer.Connected = true
@@ -486,7 +521,12 @@ func (c *Client) keepaliveLoop() {
 		case <-c.shutdown:
 			return
 		case <-ticker.C:
-			c.sendToServer(keepaliveData)
+			c.serverMu.Lock()
+			serverAlive := c.serverPipe != nil
+			c.serverMu.Unlock()
+			if serverAlive {
+				c.sendToServer(keepaliveData)
+			}
 			c.puncher.SendKeepalive()
 		}
 	}

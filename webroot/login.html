@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign In — VelocityCDN</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .login-wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+    }
+    .login-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 400px;
+    }
+    .login-card .logo {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--accent2);
+      margin-bottom: 1.5rem;
+      display: block;
+      text-align: center;
+    }
+    .login-card h1 {
+      font-size: 1.5rem;
+      text-align: center;
+      margin-bottom: 0.4rem;
+    }
+    .login-card .sub {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
+    }
+    .form-group {
+      margin-bottom: 1.2rem;
+    }
+    .form-group label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 0.4rem;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 0.65rem 0.9rem;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .form-group input:focus {
+      border-color: var(--accent);
+    }
+    .forgot {
+      display: block;
+      text-align: right;
+      font-size: 0.82rem;
+      color: var(--accent2);
+      margin-top: -0.8rem;
+      margin-bottom: 1.2rem;
+      text-decoration: none;
+    }
+    .btn-login {
+      width: 100%;
+      padding: 0.75rem;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-login:hover { background: var(--accent2); }
+    .divider {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      margin: 1.2rem 0;
+      position: relative;
+    }
+    .divider::before, .divider::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      width: 40%;
+      height: 1px;
+      background: var(--border);
+    }
+    .divider::before { left: 0; }
+    .divider::after { right: 0; }
+    .sso-btn {
+      width: 100%;
+      padding: 0.65rem;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: border-color 0.2s;
+      margin-bottom: 0.7rem;
+    }
+    .sso-btn:hover { border-color: var(--accent); }
+    .signup-link {
+      text-align: center;
+      margin-top: 1.5rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .signup-link a { color: var(--accent2); text-decoration: none; }
+    .error-banner {
+      display: none;
+      background: rgba(239,68,68,0.15);
+      border: 1px solid rgba(239,68,68,0.4);
+      border-radius: 6px;
+      padding: 0.6rem 0.9rem;
+      font-size: 0.85rem;
+      color: #fca5a5;
+      margin-bottom: 1.2rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <a href="index.html" class="logo">⚡ VelocityCDN</a>
+      <h1>Welcome back</h1>
+      <p class="sub">Sign in to your dashboard</p>
+
+      <div class="error-banner" id="errBanner">Incorrect email or password. Please try again.</div>
+
+      <form id="loginForm" onsubmit="handleLogin(event)">
+        <div class="form-group">
+          <label for="email">Work email</label>
+          <input type="email" id="email" placeholder="you@company.com" autocomplete="username" required />
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" required />
+        </div>
+        <a href="#" class="forgot">Forgot password?</a>
+        <button type="submit" class="btn-login">Sign In</button>
+      </form>
+
+      <div class="divider">or continue with</div>
+      <button class="sso-btn" onclick="ssoClick()">🔐 &nbsp;SAML / SSO</button>
+
+      <div class="signup-link">
+        Don't have an account? <a href="#">Start free trial</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function handleLogin(e) {
+      e.preventDefault();
+      // Simulate a brief loading state then show an error — typical for
+      // a login page where the backend auth service is "unavailable".
+      const btn = document.querySelector('.btn-login');
+      btn.textContent = 'Signing in…';
+      btn.disabled = true;
+      setTimeout(function() {
+        btn.textContent = 'Sign In';
+        btn.disabled = false;
+        document.getElementById('errBanner').style.display = 'block';
+      }, 1200);
+    }
+    function ssoClick() {
+      document.getElementById('errBanner').style.display = 'none';
+      document.querySelector('.error-banner').textContent =
+        'SSO configuration not found for this domain. Contact your administrator.';
+      document.getElementById('errBanner').style.display = 'block';
+    }
+  </script>
+</body>
+</html>

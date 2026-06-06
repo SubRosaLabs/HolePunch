@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RUM SDK Docs — VelocityCDN</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .docs-layout { display: flex; max-width: 1100px; margin: 0 auto; padding: 3rem 4rem; gap: 3rem; }
+    .docs-sidebar { width: 220px; flex-shrink: 0; }
+    .docs-sidebar h4 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.75rem; margin-top: 1.5rem; }
+    .docs-sidebar ul { list-style: none; }
+    .docs-sidebar ul li a { color: var(--text-muted); text-decoration: none; font-size: 0.9rem; display: block; padding: 0.3rem 0; transition: color 0.2s; }
+    .docs-sidebar ul li a:hover, .docs-sidebar ul li a.active { color: var(--accent2); }
+    .docs-content { flex: 1; min-width: 0; }
+    .docs-content h1 { font-size: 2rem; font-weight: 700; margin-bottom: 1rem; letter-spacing: -0.5px; }
+    .docs-content h2 { font-size: 1.25rem; font-weight: 600; margin: 2rem 0 0.75rem; padding-top: 2rem; border-top: 1px solid var(--border); }
+    .docs-content p { color: var(--text-muted); margin-bottom: 1rem; font-size: 0.95rem; }
+    .docs-content ul { color: var(--text-muted); margin: 0.5rem 0 1rem 1.25rem; font-size: 0.95rem; }
+    .docs-content ul li { margin-bottom: 0.4rem; }
+    .callout { background: var(--bg3); border-left: 3px solid var(--accent); border-radius: 0 var(--radius) var(--radius) 0; padding: 1rem 1.25rem; margin: 1.5rem 0; font-size: 0.9rem; color: var(--text-muted); }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.9rem; }
+    th { text-align: left; padding: 0.6rem 1rem; background: var(--bg3); color: var(--text-muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    td { padding: 0.6rem 1rem; border-top: 1px solid var(--border); color: var(--text-muted); }
+    td code, p code { background: var(--bg2); color: var(--accent2); padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.85em; font-family: "SF Mono","Fira Code",monospace; }
+    @media (max-width: 768px) { .docs-layout { flex-direction: column; padding: 2rem 1.5rem; } .docs-sidebar { width: 100%; } }
+  </style>
+</head>
+<body>
+
+  <header>
+    <nav class="navbar">
+      <div class="logo">⚡ VelocityCDN</div>
+      <ul class="nav-links">
+        <li><a href="index.html">Products</a></li>
+        <li><a href="index.html">Network</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="index.html">Pricing</a></li>
+        <li><a href="#" class="btn-nav">Sign In</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <div class="docs-layout">
+
+    <aside class="docs-sidebar">
+      <h4>Getting Started</h4>
+      <ul>
+        <li><a href="#overview" class="active">Overview</a></li>
+        <li><a href="#install">Installation</a></li>
+        <li><a href="#native-agent">Native Agent</a></li>
+      </ul>
+      <h4>Configuration</h4>
+      <ul>
+        <li><a href="#endpoint">Endpoint</a></li>
+        <li><a href="#options">Options</a></li>
+        <li><a href="#tls">TLS &amp; Certificates</a></li>
+      </ul>
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="#metrics-path">Metrics Path</a></li>
+        <li><a href="#protocol">Protocol</a></li>
+        <li><a href="#troubleshooting">Troubleshooting</a></li>
+      </ul>
+    </aside>
+
+    <main class="docs-content">
+      <h1 id="overview">RUM SDK Documentation</h1>
+      <p>The VelocityCDN Real User Monitoring (RUM) SDK collects performance telemetry from your end users and streams it to the nearest edge node in real time. This guide covers the web snippet, the native agent, and all configuration options.</p>
+
+      <h2 id="install">Web SDK Installation</h2>
+      <p>Add the following snippet to the <code>&lt;head&gt;</code> of every page you want to monitor:</p>
+      <div class="code-block">
+        <pre><code>&lt;script src="https://sdk.velocitycdn.io/rum.min.js"
+        data-endpoint="/v1/metrics"
+        data-site-id="YOUR_SITE_ID"&gt;&lt;/script&gt;</code></pre>
+      </div>
+      <p>Replace <code>YOUR_SITE_ID</code> with the site ID found in your VelocityCDN dashboard. The SDK is &lt;4 KB gzipped and loads asynchronously.</p>
+
+      <h2 id="native-agent">Native Agent</h2>
+      <p>For server-side and endpoint monitoring, install the native agent. It maintains a persistent QUIC connection to the assigned edge node, delivering sub-second metric streams with minimal CPU overhead.</p>
+      <div class="code-block">
+        <pre><code># Linux / macOS
+./velocitycdn-agent -server &lt;edge-node&gt;:443 -site-id YOUR_SITE_ID
+
+# Windows
+velocitycdn-agent.exe -server &lt;edge-node&gt;:443 -site-id YOUR_SITE_ID</code></pre>
+      </div>
+      <div class="callout">
+        The native agent uses HTTP/3 over UDP/443 for all communication. Ensure UDP/443 outbound is permitted in your firewall policy. The agent does <strong>not</strong> require inbound ports.
+      </div>
+
+      <h2 id="endpoint">Endpoint Configuration</h2>
+      <p>All telemetry is delivered to the <code>/v1/metrics</code> path on your assigned edge node. This path is fixed and cannot be changed in the Starter plan. Pro and Enterprise customers can configure a custom path via the dashboard.</p>
+
+      <h2 id="options">Configuration Options</h2>
+      <table>
+        <thead><tr><th>Option</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-server</code></td><td>string</td><td>—</td><td>Edge node hostname and port (required)</td></tr>
+          <tr><td><code>-site-id</code></td><td>string</td><td>—</td><td>Your VelocityCDN site identifier (required)</td></tr>
+          <tr><td><code>-agent-path</code></td><td>string</td><td>/v1/metrics</td><td>HTTP path for the metrics endpoint</td></tr>
+          <tr><td><code>-ignorecert</code></td><td>bool</td><td>false</td><td>Skip TLS verification (use only with self-signed edge certs in dev)</td></tr>
+          <tr><td><code>-interval</code></td><td>int</td><td>30</td><td>Flush interval in seconds</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="tls">TLS &amp; Certificates</h2>
+      <p>Edge nodes use TLS 1.3 with ECDSA certificates issued by Let's Encrypt. The native agent validates the certificate chain by default. In development environments using a private edge node with a self-signed certificate, pass <code>-ignorecert</code> to skip validation.</p>
+
+      <h2 id="metrics-path">Metrics Path</h2>
+      <p>The <code>/v1/metrics</code> endpoint accepts a long-lived HTTP/3 POST body. The agent opens the request on startup and streams length-prefixed binary frames for the lifetime of the process. The edge node closes the stream on graceful shutdown and the agent reconnects automatically.</p>
+      <div class="callout">
+        Firewall rules should allow outbound UDP/443 to the edge node IP. The metrics stream will appear as standard HTTPS traffic to passive observers.
+      </div>
+
+      <h2 id="protocol">Protocol</h2>
+      <p>The SDK uses HTTP/3 (QUIC over UDP/443) exclusively. Each agent instance opens a single multiplexed QUIC connection to the edge. Keepalive frames are exchanged every 30 seconds to maintain NAT bindings.</p>
+
+      <h2 id="troubleshooting">Troubleshooting</h2>
+      <ul>
+        <li><strong>Agent exits immediately</strong> — verify UDP/443 outbound is not blocked.</li>
+        <li><strong>TLS error</strong> — if using a dev edge node with a self-signed cert, add <code>-ignorecert</code>.</li>
+        <li><strong>No data in dashboard</strong> — check <code>-site-id</code> matches the value in your dashboard.</li>
+        <li><strong>High latency metrics</strong> — ensure the agent is pointed at the closest regional edge node.</li>
+      </ul>
+    </main>
+
+  </div>
+
+  <footer>
+    <div class="footer-grid">
+      <div>
+        <div class="logo">⚡ VelocityCDN</div>
+        <p class="footer-tagline">Fast. Reliable. Global.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <ul><li><a href="index.html">CDN</a></li><li><a href="index.html">DDoS Protection</a></li><li><a href="index.html">RUM SDK</a></li></ul>
+      </div>
+      <div>
+        <h4>Developers</h4>
+        <ul><li><a href="docs.html">Documentation</a></li><li><a href="#">API Reference</a></li><li><a href="#">Status</a></li></ul>
+      </div>
+      <div>
+        <h4>Company</h4>
+        <ul><li><a href="#">About</a></li><li><a href="#">Privacy Policy</a></li><li><a href="#">Terms of Service</a></li></ul>
+      </div>
+    </div>
+    <div class="footer-bottom"><p>© 2026 VelocityCDN, Inc. All rights reserved.</p></div>
+  </footer>
+
+</body>
+</html>

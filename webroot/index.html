@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VelocityCDN — Edge Delivery Network</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>html { scroll-behavior: smooth; }</style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <header>
+    <nav class="navbar">
+      <div class="logo">⚡ VelocityCDN</div>
+      <ul class="nav-links">
+        <li><a href="#products">Products</a></li>
+        <li><a href="#network">Network</a></li>
+        <li><a href="docs.html">Docs</a></li>
+        <li><a href="#pricing">Pricing</a></li>
+        <li><a href="login.html" class="btn-nav">Sign In</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-content">
+      <h1>Content delivery<br/>built for speed.</h1>
+      <p class="hero-sub">VelocityCDN routes your traffic through our global edge network — reducing latency, absorbing attacks, and keeping your users close to your content.</p>
+      <div class="hero-btns">
+        <a href="login.html" class="btn-primary">Get Started Free</a>
+        <a href="docs.html" class="btn-secondary">View Docs →</a>
+      </div>
+    </div>
+    <div class="hero-stat-bar">
+      <div class="stat"><span class="stat-num">47ms</span><span class="stat-label">Avg global latency</span></div>
+      <div class="stat"><span class="stat-num">99.99%</span><span class="stat-label">Uptime SLA</span></div>
+      <div class="stat"><span class="stat-num">38</span><span class="stat-label">Edge PoPs</span></div>
+      <div class="stat"><span class="stat-num">3.2 Tbps</span><span class="stat-label">Network capacity</span></div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="features" id="products">
+    <h2>Everything your infrastructure needs</h2>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🌐</div>
+        <h3>Global Edge Caching</h3>
+        <p>Serve static and dynamic content from the edge node closest to your user. Cache rules, TTLs, and purge APIs included.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛡️</div>
+        <h3>DDoS Mitigation</h3>
+        <p>Always-on layer 3/4 scrubbing and configurable layer 7 WAF rules. Attacks are absorbed at the edge before touching your origin.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📡</div>
+        <h3>Real User Monitoring</h3>
+        <p>Our lightweight SDK reports performance telemetry from end-user sessions to <code>/v1/metrics</code> — giving you real latency, TTFB, and error rates from the field.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔒</div>
+        <h3>TLS Everywhere</h3>
+        <p>Automatic certificate provisioning via ACME. HTTP/3 and QUIC support enabled by default on all edge nodes for maximum throughput.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⚙️</div>
+        <h3>Edge Workers</h3>
+        <p>Run custom logic at the edge with sub-millisecond cold starts. Modify requests, rewrite URLs, or run A/B tests without touching your origin.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📊</div>
+        <h3>Analytics &amp; Logs</h3>
+        <p>Real-time dashboards, log streaming, and alerting. Drill into traffic by region, ASN, status code, or cache status.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- SDK SECTION -->
+  <section class="sdk-section" id="network">
+    <div class="sdk-content">
+      <h2>RUM SDK — field performance in minutes</h2>
+      <p>Drop our 4 KB JavaScript snippet or install the native agent on your endpoints. It connects to the nearest VelocityCDN edge node and streams performance events in real time — no sampling, no data loss.</p>
+      <div class="code-block">
+        <pre><code>&lt;!-- Web SDK --&gt;
+&lt;script src="https://sdk.velocitycdn.io/rum.min.js"
+        data-endpoint="/v1/metrics"
+        data-site-id="YOUR_SITE_ID"&gt;&lt;/script&gt;</code></pre>
+      </div>
+      <p class="sdk-note">The native agent for Linux, macOS, and Windows uses an always-on QUIC connection to the assigned edge node for minimal overhead and consistent sub-second metric delivery.</p>
+      <a href="docs.html" class="btn-primary">Read the SDK docs →</a>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section class="pricing" id="pricing">
+    <h2>Simple, predictable pricing</h2>
+    <div class="pricing-grid">
+      <div class="pricing-card">
+        <h3>Starter</h3>
+        <div class="price">Free</div>
+        <ul>
+          <li>100 GB bandwidth / mo</li>
+          <li>5 edge PoPs</li>
+          <li>Basic DDoS protection</li>
+          <li>RUM SDK included</li>
+          <li>Community support</li>
+        </ul>
+        <a href="login.html" class="btn-primary">Get Started</a>
+      </div>
+      <div class="pricing-card featured">
+        <div class="badge">Most Popular</div>
+        <h3>Pro</h3>
+        <div class="price">$49<span>/mo</span></div>
+        <ul>
+          <li>2 TB bandwidth / mo</li>
+          <li>All 38 edge PoPs</li>
+          <li>Advanced WAF</li>
+          <li>Full RUM analytics</li>
+          <li>Email + chat support</li>
+        </ul>
+        <a href="login.html" class="btn-primary">Start Free Trial</a>
+      </div>
+      <div class="pricing-card">
+        <h3>Enterprise</h3>
+        <div class="price">Custom</div>
+        <ul>
+          <li>Unlimited bandwidth</li>
+          <li>Dedicated edge nodes</li>
+          <li>SLA + uptime guarantee</li>
+          <li>Custom integrations</li>
+          <li>Dedicated support</li>
+        </ul>
+        <a href="#" class="btn-secondary">Contact Sales</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <div class="footer-grid">
+      <div>
+        <div class="logo">⚡ VelocityCDN</div>
+        <p class="footer-tagline">Fast. Reliable. Global.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <ul>
+          <li><a href="#">CDN</a></li>
+          <li><a href="#">DDoS Protection</a></li>
+          <li><a href="#">Edge Workers</a></li>
+          <li><a href="#">RUM SDK</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Developers</h4>
+        <ul>
+          <li><a href="docs.html">Documentation</a></li>
+          <li><a href="#">API Reference</a></li>
+          <li><a href="#">Status</a></li>
+          <li><a href="#">Changelog</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Company</h4>
+        <ul>
+          <li><a href="#">About</a></li>
+          <li><a href="#">Blog</a></li>
+          <li><a href="#">Privacy Policy</a></li>
+          <li><a href="#">Terms of Service</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>© 2026 VelocityCDN, Inc. All rights reserved.</p>
+    </div>
+  </footer>
+
+</body>
+</html>
