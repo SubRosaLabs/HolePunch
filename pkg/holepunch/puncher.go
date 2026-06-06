@@ -22,7 +22,7 @@ type PeerConnection struct {
 
 // Puncher handles UDP hole punching with connection behavior
 type Puncher struct {
-	conn         *net.UDPConn
+	conn         net.PacketConn
 	localKeys    *KeyPair
 	peers        map[[32]byte]*PeerConnection
 	pubKeyToPeer map[[32]byte][32]byte // PublicKey -> PeerID mapping
@@ -35,7 +35,7 @@ type Puncher struct {
 }
 
 // NewPuncher creates a new hole puncher with connection handling
-func NewPuncher(conn *net.UDPConn, keys *KeyPair) *Puncher {
+func NewPuncher(conn net.PacketConn, keys *KeyPair) *Puncher {
 	return &Puncher{
 		conn:         conn,
 		localKeys:    keys,
@@ -107,7 +107,7 @@ func (p *Puncher) InitiatePunchWithAllowedIPs(peerID [32]byte, peerPublicKey [32
 	punchData := keyExMsg.Serialize()
 
 	for i := 0; i < 5; i++ {
-		_, err := p.conn.WriteToUDP(punchData, peerAddr)
+		_, err := p.conn.WriteTo(punchData, peerAddr)
 		if err != nil {
 			return fmt.Errorf("failed to send punch packet: %w", err)
 		}
@@ -202,7 +202,7 @@ func (p *Puncher) handleKeyExchange(data []byte, addr *net.UDPAddr) error {
 
 		// Send our public key back
 		keyExMsg := &protocol.KeyExchangeMessage{PublicKey: p.localKeys.PublicKey}
-		p.conn.WriteToUDP(keyExMsg.Serialize(), addr)
+		p.conn.WriteTo(keyExMsg.Serialize(), addr)
 
 		if p.onPeerConn != nil {
 			go p.onPeerConn(peerID)
@@ -226,7 +226,7 @@ func (p *Puncher) handleKeyExchange(data []byte, addr *net.UDPAddr) error {
 			// Acknowledge the new endpoint with a single KE. The peer's
 			// own roam-check will see no further address change and stop.
 			keyExMsg := &protocol.KeyExchangeMessage{PublicKey: p.localKeys.PublicKey}
-			p.conn.WriteToUDP(keyExMsg.Serialize(), addr)
+			p.conn.WriteTo(keyExMsg.Serialize(), addr)
 		}
 	}
 
@@ -283,7 +283,7 @@ func (p *Puncher) handleData(data []byte, addr *net.UDPAddr) error {
 	}
 
 	if p.onData != nil {
-		go p.onData(peer.PeerID, plaintext)
+		p.onData(peer.PeerID, plaintext)
 	}
 
 	return nil
@@ -324,7 +324,7 @@ func (p *Puncher) SendToPeer(peerID [32]byte, data []byte) error {
 		Ciphertext: ciphertext,
 	}
 
-	_, err = p.conn.WriteToUDP(msg.Serialize(), peer.Addr)
+	_, err = p.conn.WriteTo(msg.Serialize(), peer.Addr)
 	return err
 }
 
@@ -337,7 +337,7 @@ func (p *Puncher) SendKeepalive() {
 	defer p.peersMu.RUnlock()
 
 	for _, peer := range p.peers {
-		p.conn.WriteToUDP(data, peer.Addr)
+		p.conn.WriteTo(data, peer.Addr)
 	}
 }
 

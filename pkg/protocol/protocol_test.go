@@ -112,9 +112,9 @@ func TestAuthResultRoundtrip(t *testing.T) {
 	}
 }
 
-func TestWireVersionIsTwo(t *testing.T) {
+func TestWireVersionIsThree(t *testing.T) {
 	// Sanity guard: bumping this constant is a breaking protocol change.
-	if WireVersion != 2 {
-		t.Errorf("WireVersion: got %d, want 2", WireVersion)
+	if WireVersion != 3 {
+		t.Errorf("WireVersion: got %d, want 3", WireVersion)
 	}
 }

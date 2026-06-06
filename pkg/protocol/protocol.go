@@ -7,11 +7,10 @@ import (
 	"net"
 )
 
-// Wire-format version. Bumped to 2 when operator authentication was added:
-// RegisterAck now carries a session nonce body, and AuthRequest / AuthResult
-// messages were introduced. A v1 client cannot interoperate with a v2 server
-// (and vice versa) — Header.Version mismatches are dropped at handlePacket.
-const WireVersion uint8 = 2
+// Wire-format version. Bumped to 3 when transport moved from raw UDP to
+// HTTP/3 (QUIC). The same binary framing is used over the stream; the version
+// guard prevents stale raw-UDP clients from confusing the new server.
+const WireVersion uint8 = 3
 
 // Message types
 const (
@@ -186,7 +185,7 @@ func (m *PunchInitMessage) Serialize() []byte {
 		addrBytes = m.PeerAddr.IP.To16()
 	}
 
-	header := Header{Version: WireVersion, Type: MsgTypePunchInit, Length: uint16(64 + 2 + len(addrBytes))}
+	header := Header{Version: WireVersion, Type: MsgTypePunchInit, Length: uint16(64 + 2 + 1 + len(addrBytes))}
 	buf := header.Serialize()
 	buf = append(buf, m.PeerID[:]...)
 	buf = append(buf, m.PeerPublicKey[:]...)

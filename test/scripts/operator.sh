@@ -20,7 +20,7 @@ echo "[mybox1] starting operator client..."
 # Start client with stdin from the FIFO; both stdout and stderr go to the log
 # file.  Because stdin is not a TTY, the interactive shell skips the prompt,
 # making the log clean to grep.
-holepunch-client -server "$ORCHESTRATOR" -key "$KEY" < "$PIPE" >"$LOG" 2>&1 &
+holepunch-client -server "$ORCHESTRATOR" -key "$KEY" -ignorecert < "$PIPE" >"$LOG" 2>&1 &
 HP_PID=$!
 
 # Hold the write end open so the FIFO never EOF's the client.
@@ -82,6 +82,20 @@ send_cmd "rlistener add 4445:127.0.0.1:4445"
 wait_log "Reverse listener: agent:0.0.0.0:4445" "rlistener ready" 15
 
 echo "[mybox1] ✓ Reverse listener ready: OrgBox1:4445 -> 127.0.0.1:4445"
+
+# ── Step 7: SOCKS5 proxy (Test 6) ────────────────────────────────────────────
+send_cmd "socks start 1080"
+wait_log "SOCKS5 started:" "SOCKS5 ready" 10
+
+echo "[mybox1] ✓ SOCKS5 ready: 127.0.0.1:1080"
+
+# ── Step 8: TUN interface (Test 7) ───────────────────────────────────────────
+send_cmd "tunnel start"
+wait_log "Tunnel holepunch0 is up" "TUN interface up" 10
+send_cmd "route add 172.30.0.0/24"
+wait_log "Route added: 172.30.0.0/24" "TUN route added" 10
+
+echo "[mybox1] ✓ TUN ready: holepunch0 routing 172.30.0.0/24 via OrgBox1"
 
 # Stay alive so listeners remain active for the tests.
 wait "$HP_PID"
