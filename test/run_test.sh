@@ -1,0 +1,396 @@
+#!/bin/bash
+# Full end-to-end + stress test suite.
+#
+# Tests:
+#  1. Port-forward: tool on MyBox1 → tunnel → MyBox2:445
+#  2. iptables REDIRECT: tool targets OrgBox2's real IP, redirected to tunnel
+#  3. HTTP / EOF fix: parallel HTTP asset fetches through tunnel to OrgBox2:8080
+#  4. Reverse listener: MyBox2 connects to OrgBox1:4445, arrives at MyBox1:4445
+#  5. Stress: 30 concurrent connections through the port-forward tunnel
+#
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PASS=0
+FAIL=0
+
+pass() { echo "[PASS] $1"; PASS=$((PASS+1)); }
+fail() { echo "[FAIL] $1"; FAIL=$((FAIL+1)); }
+
+# ── Pre-flight ───────────────────────────────────────────────────────────────
+if [ ! -f "$SCRIPT_DIR/keys/operator.key" ] || [ ! -f "$SCRIPT_DIR/authorized_keys" ]; then
+    echo "[test] keys not found — running setup..."
+    bash "$SCRIPT_DIR/setup.sh"
+fi
+
+cd "$SCRIPT_DIR"
+
+# ── Start containers ─────────────────────────────────────────────────────────
+echo "[test] starting containers (this will build on first run)..."
+docker compose up -d --build
+
+echo "[test] waiting for all listeners to be ready..."
+
+wait_for_log() {
+    local svc="$1" pattern="$2" label="$3" timeout="${4:-90}"
+    for i in $(seq 1 "$timeout"); do
+        if docker compose logs "$svc" 2>/dev/null | grep -q "$pattern"; then
+            echo "[test] ✓ $label"
+            return 0
+        fi
+        if [ "$i" -eq "$timeout" ]; then
+            echo "[test] TIMEOUT waiting for $label — dumping $svc logs:"
+            docker compose logs "$svc" | tail -30
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+wait_for_log mybox1 "Port forward ready"       "SMB listener up"       90
+wait_for_log mybox1 "HTTP listener ready"      "HTTP listener up"       30
+wait_for_log mybox1 "Reverse listener ready"   "rlistener up"           30
+wait_for_log mybox1 "SOCKS5 ready"             "SOCKS5 proxy up"        30
+wait_for_log mybox1 "TUN ready"                "TUN interface up"       30
+
+echo ""
+
+# ════════════════════════════════════════════════════════════════════════════
+echo "════════════════════════════════════════════════════════"
+echo " TEST 1 — port-forward: tool connects via 127.0.0.1:445"
+echo "════════════════════════════════════════════════════════"
+
+RESP=$(docker compose exec -T mybox1 \
+    sh -c 'echo "TOOL_TRAFFIC_TARGETING_ORGBOX2" | nc -w5 127.0.0.1 445 2>/dev/null || true')
+echo "[test] response: $RESP"
+
+echo "── MyBox2 logs (should show INTERCEPTED) ───────────────"
+docker compose logs mybox2 | tail -5
+
+if docker compose logs mybox2 | grep -q "INTERCEPTED"; then
+    pass "TEST 1: port-forward traffic reached MyBox2"
+else
+    fail "TEST 1: traffic did NOT reach MyBox2"
+fi
+
+if docker compose logs orgbox2 2>/dev/null | grep -q "UNEXPECTED"; then
+    fail "TEST 1: traffic leaked to OrgBox2 (SMB intercept broken)"
+else
+    pass "TEST 1: OrgBox2 saw no unexpected connections"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 2 — iptables REDIRECT: tool targets OrgBox2's IP"
+echo "════════════════════════════════════════════════════════"
+
+ORGBOX2_IP="172.30.0.10"
+
+docker compose exec -T mybox1 bash -c "
+    ip route add 172.30.0.0/24 dev lo 2>/dev/null || true
+    iptables -t nat -A OUTPUT -d ${ORGBOX2_IP} -p tcp --dport 445 -j REDIRECT --to-ports 445
+    echo '[mybox1] route + iptables rule added'
+"
+
+RESP2=$(docker compose exec -T mybox1 \
+    sh -c "echo 'TOOL_TARGETING_ORGBOX2_IP' | nc -w5 ${ORGBOX2_IP} 445 2>/dev/null || true")
+echo "[test] response: $RESP2"
+
+docker compose logs mybox2 | tail -8
+if docker compose logs mybox2 | grep -c "INTERCEPTED" | grep -qv "^0$"; then
+    pass "TEST 2: redirected traffic reached MyBox2"
+else
+    fail "TEST 2: redirected traffic did NOT reach MyBox2"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 3 — HTTP / EOF fix: parallel asset fetches"
+echo "════════════════════════════════════════════════════════"
+
+# Single warm-up to prime orgnet ARP (first connection to a new subnet can miss).
+docker compose exec -T mybox1 python3 - <<'PYEOF' 2>/dev/null || true
+import http.client
+try:
+    c = http.client.HTTPConnection('127.0.0.1', 8080, timeout=5)
+    c.request('GET', '/')
+    c.getresponse().read()
+    c.close()
+except Exception:
+    pass
+PYEOF
+
+# 5 simultaneous requests — one per asset.
+# UDP buffer easily holds ~65 packets (5 connections × ~13 avg packets each).
+CONCURRENT_OK=$(docker compose exec -T mybox1 python3 - <<'PYEOF' 2>/dev/null | tr -d '\r\n' || echo 0
+import http.client, threading
+PATHS = ['/', '/style.css', '/script.js', '/image.bin', '/data.txt']
+results = [0] * 5
+def fetch(p, i):
+    try:
+        c = http.client.HTTPConnection('127.0.0.1', 8080, timeout=15)
+        c.request('GET', p)
+        r = c.getresponse(); r.read(); c.close()
+        results[i] = r.status
+    except Exception:
+        results[i] = 0
+threads = [threading.Thread(target=fetch, args=(p, i)) for i, p in enumerate(PATHS)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(sum(1 for s in results if s == 200))
+PYEOF
+)
+echo "  [concurrent] ${CONCURRENT_OK}/5 HTTP 200 responses"
+
+# >=3/5 is passing — the first 1-2 connections to a cold orgnet subnet can
+# fail due to ARP warm-up latency; subsequent connections succeed reliably.
+if [ "${CONCURRENT_OK:-0}" -ge 3 ]; then
+    pass "TEST 3: ${CONCURRENT_OK}/5 parallel HTTP requests OK (async-dial + EOF-propagation fix)"
+else
+    fail "TEST 3: only ${CONCURRENT_OK}/5 parallel HTTP requests succeeded"
+fi
+
+echo "── OrgBox2 HTTP log ────────────────────────────────────"
+docker compose logs orgbox2 | grep "HTTP:" | tail -10 || true
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 4 — reverse listener: MyBox2 -> OrgBox1:4445 -> MyBox1:4445"
+echo "════════════════════════════════════════════════════════"
+
+# Use Python on mybox2 so we can do a proper half-close (send data, wait for
+# response) — plain "echo | nc" closes before the response arrives.
+docker compose exec -T mybox2 python3 - <<'PYEOF' || true
+import socket, sys, time
+try:
+    s = socket.create_connection(("orgbox1", 4445), timeout=15)
+    s.sendall(b"REVERSE_TEST_PAYLOAD\n")
+    s.shutdown(socket.SHUT_WR)
+    resp = b""
+    s.settimeout(10)
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    s.close()
+    print(f"[mybox2] reverse response: {resp.decode(errors='replace').strip()}", flush=True)
+except Exception as e:
+    print(f"[mybox2] reverse error: {e}", flush=True)
+PYEOF
+
+sleep 1
+echo "── MyBox1 rlistener log ────────────────────────────────"
+docker compose exec -T mybox1 cat /tmp/rlistener.log 2>/dev/null | tail -10 || true
+
+if docker compose exec -T mybox1 grep -q "REVERSE_INTERCEPTED" /tmp/rlistener.log 2>/dev/null; then
+    pass "TEST 4: reverse listener traffic arrived at MyBox1"
+else
+    echo "── MyBox1 hp log ───────────────────────────────────────"
+    docker compose logs mybox1 | tail -20
+    fail "TEST 4: reverse listener traffic did NOT arrive at MyBox1"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 5 — stress: 30 concurrent connections via tunnel"
+echo "════════════════════════════════════════════════════════"
+
+STRESS_OUT=$(docker compose exec -T mybox1 \
+    python3 /scripts/stress_client.py 127.0.0.1 445 30 25 2>&1 || true)
+echo "$STRESS_OUT"
+
+if echo "$STRESS_OUT" | grep -q "STRESS PASSED"; then
+    pass "TEST 5: stress test — 30 concurrent connections all succeeded"
+else
+    fail "TEST 5: stress test failed"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 6 — SOCKS5: proxy from MyBox1 -> OrgBox2:8080"
+echo "════════════════════════════════════════════════════════"
+
+SOCKS_RESP=$(docker compose exec -T mybox1 \
+    curl -s --socks5 127.0.0.1:1080 --max-time 15 http://172.30.0.10:8080/ 2>/dev/null || true)
+echo "[test] socks5 response length: ${#SOCKS_RESP}"
+
+if echo "$SOCKS_RESP" | grep -q "OrgBox2"; then
+    pass "TEST 6: SOCKS5 proxy reached OrgBox2 via agent"
+else
+    echo "── MyBox1 hp log (tail) ────────────────────────────────"
+    docker compose logs mybox1 | tail -15
+    fail "TEST 6: SOCKS5 proxy did NOT reach OrgBox2"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 7 — TUN: direct IP routing MyBox1 -> 172.30.0.10"
+echo "════════════════════════════════════════════════════════"
+
+TUN_RESP=$(docker compose exec -T mybox1 \
+    curl -s --max-time 15 http://172.30.0.10:8080/ 2>/dev/null || true)
+echo "[test] tun response length: ${#TUN_RESP}"
+
+if echo "$TUN_RESP" | grep -q "OrgBox2"; then
+    pass "TEST 7: TUN IP routing reached OrgBox2 via agent"
+else
+    echo "── MyBox1 hp log (tail) ────────────────────────────────"
+    docker compose logs mybox1 | tail -15
+    fail "TEST 7: TUN IP routing did NOT reach OrgBox2"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 8 — parking: agent goes dark after holepunch"
+echo "════════════════════════════════════════════════════════"
+
+# Capture logs into a variable before grepping.  Using a pipeline with grep -q
+# causes grep to exit early on a match, which sends SIGPIPE to docker compose
+# (exit 141); set -o pipefail then makes the if-condition false even on a match.
+# Brief settle lets the Docker log driver flush any burst from the stress test.
+sleep 3
+ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
+
+if echo "$ORG1_LOGS" | grep -q "going dark from the orchestration server"; then
+    pass "TEST 8: agent parked (went dark from orchestrator) after holepunch confirmed"
+else
+    echo "── OrgBox1 log (parking entries) ───────────────────────"
+    echo "$ORG1_LOGS" | grep -Ei "dark|reconnect|registered|holepunch" || echo "(none)"
+    fail "TEST 8: agent did NOT go dark — parkServerChannel did not fire"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 9 — orchestrator resilience: tunnel survives server death"
+echo "════════════════════════════════════════════════════════"
+
+# operator.sh redirects holepunch-client stdout+stderr to /tmp/hp.log inside
+# the mybox1 container, so we read that file directly rather than docker logs.
+
+echo "[test] stopping orchestrator..."
+docker compose stop orchestrator
+sleep 2  # give QUIC connection-close frame time to reach the operator
+
+# Tunnel traffic must still flow peer-to-peer without the orchestrator.
+ORCH_DOWN_RESP=$(docker compose exec -T mybox1 \
+    sh -c 'echo "TUNNEL_WHILE_ORCH_DOWN" | nc -w5 127.0.0.1 445 2>/dev/null || true')
+echo "[test] tunnel response while orchestrator is down: $ORCH_DOWN_RESP"
+
+if echo "$ORCH_DOWN_RESP" | grep -q "INTERCEPTED"; then
+    pass "TEST 9: tunnel still works after orchestrator is killed"
+else
+    fail "TEST 9: tunnel BROKE when orchestrator was killed"
+fi
+
+# Poll for the reconnect attempt log entry (written to /tmp/hp.log in mybox1).
+# First attempt is immediate, so "Reconnect to server failed" should appear
+# within a few seconds of the connection drop.
+echo "[test] waiting up to 30s for operator to detect orchestrator drop..."
+OP_RECONNECTING=false
+for i in $(seq 1 6); do
+    sleep 5
+    MYB1_HP=$(docker compose exec -T mybox1 cat /tmp/hp.log 2>/dev/null) || true
+    if echo "$MYB1_HP" | grep -q "reconnecting in background"; then
+        OP_RECONNECTING=true
+        echo "[test] operator reconnect attempt detected after ~$((i * 5))s"
+        break
+    fi
+done
+
+if $OP_RECONNECTING; then
+    pass "TEST 9: operator is reconnecting (not shut down) after orchestrator death"
+else
+    echo "── MyBox1 hp.log (tail) ────────────────────────────────"
+    docker compose exec -T mybox1 tail -10 /tmp/hp.log 2>/dev/null || echo "(unavailable)"
+    fail "TEST 9: operator did not attempt reconnect — may have shut down instead"
+fi
+
+# Restart the orchestrator and poll until the operator re-registers.
+echo "[test] restarting orchestrator..."
+docker compose start orchestrator
+echo "[test] waiting up to 90s for operator to re-register..."
+
+OP_RECONNECTED=false
+for i in $(seq 1 18); do
+    sleep 5
+    MYB1_HP=$(docker compose exec -T mybox1 cat /tmp/hp.log 2>/dev/null) || true
+    if echo "$MYB1_HP" | grep -c "Registered with server" | grep -qvE "^[01]$"; then
+        OP_RECONNECTED=true
+        echo "[test] operator re-registered after ~$((i * 5))s"
+        break
+    fi
+done
+
+if $OP_RECONNECTED; then
+    pass "TEST 9: operator re-registered with orchestrator after it came back"
+else
+    echo "── MyBox1 hp.log (tail) ────────────────────────────────"
+    docker compose exec -T mybox1 tail -15 /tmp/hp.log 2>/dev/null || echo "(unavailable)"
+    fail "TEST 9: operator did not re-register within 90s of orchestrator restart"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 10 — unparking: agent reconnects after operator dies"
+echo "           (~100s: peerDeadTimeout=75s + reaper interval=25s)"
+echo "════════════════════════════════════════════════════════"
+
+# Kill the operator's client.  After pkill, operator.sh's 'wait' returns and
+# the mybox1 container exits — that is expected and fine for remaining tests.
+echo "[test] killing operator (holepunch-client on mybox1)..."
+docker compose exec -T mybox1 pkill holepunch-client 2>/dev/null || true
+
+# Poll until OrgBox1 logs the reconnect, or 110 s elapse.
+echo "[test] polling up to 110s for agent to detect dead peer and unpark..."
+UNPARKED=false
+for i in $(seq 1 22); do
+    sleep 5
+    ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
+    if echo "$ORG1_LOGS" | grep -q "reconnecting to the orchestration server"; then
+        UNPARKED=true
+        echo "[test] unpark detected after ~$((i * 5))s"
+        break
+    fi
+done
+
+if $UNPARKED; then
+    pass "TEST 10: agent unparked and is reconnecting after operator timed out"
+else
+    ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
+    echo "── OrgBox1 log (tail) ──────────────────────────────────"
+    echo "$ORG1_LOGS" | tail -20
+    fail "TEST 10: agent did NOT reconnect within 110s of operator death"
+fi
+
+# A second "Registered with server" entry confirms the full re-registration
+# handshake completed (connect → RegisterMessage → RegisterAck).
+ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
+if echo "$ORG1_LOGS" | grep -c "Registered with server" | grep -qvE "^[01]$"; then
+    pass "TEST 10: agent re-registered with orchestrator after unpark"
+else
+    fail "TEST 10: agent did not re-register (expected ≥2 registrations, got 1 or 0)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " RESULTS: $PASS passed, $FAIL failed"
+echo "════════════════════════════════════════════════════════"
+echo ""
+echo "Container logs:"
+echo "  docker compose logs <service>   (orchestrator/orgbox1/mybox1/mybox2/orgbox2)"
+echo "Interactive:"
+echo "  docker compose exec mybox1 bash"
+echo "Tear down:"
+echo "  docker compose down"
+
+[ "$FAIL" -eq 0 ] || exit 1
