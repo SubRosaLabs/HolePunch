@@ -58,7 +58,7 @@ On your operator box, generate a keypair:
 ```
 
 Copy the printed line into `authorized_keys` on the orchestrator (one base64
-pubkey per line; `#` for comments).
+pubkey per line).
 
 **1. Orchestrator (public VPS)**
 
