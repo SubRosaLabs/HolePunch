@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+
 	"flag"
 	"fmt"
 	"io"
@@ -17,10 +18,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,6 +99,10 @@ type Client struct {
 	// reconnecting is true while reconnectServerChannel is running, preventing
 	// duplicate reconnect goroutines from racing each other.
 	reconnecting bool
+
+	// confirmingExit is set by the signal handler to coordinate a y/n prompt
+	// with the interactive loop.
+	confirmingExit atomic.Bool
 }
 
 type PeerEntry struct {
@@ -103,6 +110,7 @@ type PeerEntry struct {
 	PublicKey [32]byte
 	Addr      *net.UDPAddr
 	Connected bool
+	Meta      *protocol.AgentMetadata
 }
 
 func NewClient(serverAddr, agentPath string, useIPv6 bool, edPrivKey ed25519.PrivateKey, ignoreCert bool) (*Client, error) {
@@ -226,6 +234,17 @@ func (c *Client) sendToServer(data []byte) {
 	}
 }
 
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in %s: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
 func (c *Client) Run() error {
 	log.Printf("Client ID: %s", hex.EncodeToString(c.clientID[:8]))
 	log.Printf("Connecting to: %s", c.serverAddr)
@@ -238,18 +257,49 @@ func (c *Client) Run() error {
 		return fmt.Errorf("register failed: %w", err)
 	}
 
-	go c.serverReceiveLoop()
-	go c.peerReceiveLoop()
-	go c.keepaliveLoop()
-	go c.reaperLoop()
-	go c.interactiveMode()
+	safeGo("serverReceiveLoop", c.serverReceiveLoop)
+	safeGo("peerReceiveLoop", c.peerReceiveLoop)
+	safeGo("keepaliveLoop", c.keepaliveLoop)
+	safeGo("reaperLoop", c.reaperLoop)
+	safeGo("interactiveMode", c.interactiveMode)
 
 	<-c.shutdown
 	return nil
 }
 
+func currentUsername() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return ""
+}
+
+func localIPAddresses() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	var ips []string
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			ips = append(ips, ipnet.IP.String())
+		}
+	}
+	return strings.Join(ips, ",")
+}
+
 func (c *Client) register() error {
-	msg := &protocol.RegisterMessage{ClientID: c.clientID, PublicKey: c.keys.PublicKey}
+	meta := &protocol.AgentMetadata{
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
+		LocalIPs: localIPAddresses(),
+	}
+	if h, err := os.Hostname(); err == nil {
+		meta.Hostname = h
+	}
+	meta.Username = currentUsername()
+
+	msg := &protocol.RegisterMessage{ClientID: c.clientID, PublicKey: c.keys.PublicKey, Meta: meta}
 	c.sendToServer(msg.Serialize())
 	return nil
 }
@@ -453,10 +503,25 @@ func (c *Client) handlePeerList(data []byte) {
 		}
 		offset += ipLen
 
+		if offset+2 <= len(data) {
+			metaLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2
+			if metaLen > 0 && offset+metaLen <= len(data) {
+				peer.Meta = protocol.ParseAgentMetadata(data[offset : offset+metaLen])
+				offset += metaLen
+			}
+		}
+
 		hexID := hex.EncodeToString(peer.ID[:8])
-		if _, exists := c.peers[hexID]; !exists {
+		if existing, exists := c.peers[hexID]; !exists {
 			c.peers[hexID] = peer
-			log.Printf("Agent discovered: %s at %s", hexID, peer.Addr.String())
+			label := hexID
+			if peer.Meta != nil && peer.Meta.Hostname != "" {
+				label = peer.Meta.Hostname + " (" + hexID + ")"
+			}
+			log.Printf("Agent discovered: %s at %s", label, peer.Addr.String())
+		} else {
+			existing.Meta = peer.Meta
 		}
 	}
 }
@@ -621,7 +686,7 @@ func (c *Client) reconnectServerChannel() {
 			continue
 		}
 		log.Println("Reconnected to orchestration server")
-		go c.serverReceiveLoop()
+		safeGo("serverReceiveLoop", c.serverReceiveLoop)
 		return
 	}
 }
@@ -700,6 +765,20 @@ func (c *Client) interactiveMode() {
 	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+
+		if c.confirmingExit.CompareAndSwap(true, false) {
+			lower := strings.ToLower(line)
+			if lower == "y" || lower == "yes" {
+				c.Shutdown()
+				return
+			}
+			fmt.Println("Exit cancelled.")
+			if tty {
+				fmt.Print(config.Prompt)
+			}
+			continue
+		}
+
 		if line == "" {
 			if tty {
 				fmt.Print(config.Prompt)
@@ -859,7 +938,30 @@ func (c *Client) cmdAgents() {
 		if c.session != nil && c.session.ID == peer.ID {
 			selected = " [SELECTED]"
 		}
-		fmt.Printf("  %s - %s (%s)%s\n", hexID, peer.Addr.String(), status, selected)
+		metaStr := ""
+		if peer.Meta != nil {
+			var parts []string
+			if peer.Meta.Hostname != "" {
+				parts = append(parts, peer.Meta.Hostname)
+			}
+			if peer.Meta.Username != "" {
+				parts = append(parts, peer.Meta.Username)
+			}
+			if peer.Meta.OS != "" {
+				osInfo := peer.Meta.OS
+				if peer.Meta.Arch != "" {
+					osInfo += "/" + peer.Meta.Arch
+				}
+				parts = append(parts, osInfo)
+			}
+			if peer.Meta.LocalIPs != "" {
+				parts = append(parts, peer.Meta.LocalIPs)
+			}
+			if len(parts) > 0 {
+				metaStr = " [" + strings.Join(parts, ", ") + "]"
+			}
+		}
+		fmt.Printf("  %s - %s (%s)%s%s\n", hexID, peer.Addr.String(), status, metaStr, selected)
 	}
 	fmt.Println()
 }
@@ -961,7 +1063,7 @@ func (c *Client) startTunnel() {
 	c.stateMu.Unlock()
 
 	c.proxyManager.SetTUNWriter(c.tunWritePacket)
-	go c.tunReadLoop()
+	safeGo("tunReadLoop", c.tunReadLoop)
 
 	fmt.Printf("Tunnel %s is up\n", iface)
 	fmt.Println("Add routes: route add <cidr>")
@@ -1106,12 +1208,18 @@ func (c *Client) cmdRoute(args []string) {
 }
 
 func (c *Client) addRoute(cidr string) {
-	if !c.tunnelStarted {
+	c.stateMu.RLock()
+	started := c.tunnelStarted
+	session := c.session
+	iface := c.tunnelIface
+	c.stateMu.RUnlock()
+
+	if !started {
 		fmt.Println("Start tunnel first")
 		return
 	}
 
-	if c.session == nil {
+	if session == nil {
 		fmt.Println("No session")
 		return
 	}
@@ -1122,7 +1230,7 @@ func (c *Client) addRoute(cidr string) {
 		return
 	}
 
-	if err := c.puncher.AddAllowedIP(c.session.ID, *ipnet); err != nil {
+	if err := c.puncher.AddAllowedIP(session.ID, *ipnet); err != nil {
 		fmt.Printf("Failed to add allowed IP: %v\n", err)
 		return
 	}
@@ -1130,7 +1238,7 @@ func (c *Client) addRoute(cidr string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "linux":
-		cmd = exec.Command("ip", "route", "add", cidr, "dev", c.tunnelIface)
+		cmd = exec.Command("ip", "route", "add", cidr, "dev", iface)
 	case "darwin":
 		cmd = exec.Command("route", "-n", "add", "-net", cidr, "240.0.0.1")
 	}
@@ -1142,15 +1250,21 @@ func (c *Client) addRoute(cidr string) {
 		}
 	}
 
+	c.stateMu.Lock()
 	c.tunnelRoutes = append(c.tunnelRoutes, cidr)
+	c.stateMu.Unlock()
 	fmt.Printf("Route added: %s (AllowedIP for peer)\n", cidr)
 }
 
 func (c *Client) delRoute(cidr string) {
 	_, ipnet, _ := net.ParseCIDR(cidr)
 
-	if c.session != nil && ipnet != nil {
-		c.puncher.RemoveAllowedIP(c.session.ID, *ipnet)
+	c.stateMu.RLock()
+	session := c.session
+	c.stateMu.RUnlock()
+
+	if session != nil && ipnet != nil {
+		c.puncher.RemoveAllowedIP(session.ID, *ipnet)
 	}
 
 	var cmd *exec.Cmd
@@ -1162,6 +1276,7 @@ func (c *Client) delRoute(cidr string) {
 	}
 	cmd.Run()
 
+	c.stateMu.Lock()
 	var newRoutes []string
 	for _, r := range c.tunnelRoutes {
 		if r != cidr {
@@ -1169,19 +1284,26 @@ func (c *Client) delRoute(cidr string) {
 		}
 	}
 	c.tunnelRoutes = newRoutes
+	c.stateMu.Unlock()
 	fmt.Printf("Route removed: %s\n", cidr)
 }
 
 func (c *Client) listRoutes() {
-	if len(c.tunnelRoutes) == 0 {
+	c.stateMu.RLock()
+	routes := make([]string, len(c.tunnelRoutes))
+	copy(routes, c.tunnelRoutes)
+	session := c.session
+	c.stateMu.RUnlock()
+
+	if len(routes) == 0 {
 		fmt.Println("No routes")
 		return
 	}
 	fmt.Println("Routes (AllowedIPs):")
-	for _, r := range c.tunnelRoutes {
+	for _, r := range routes {
 		peerInfo := ""
-		if c.session != nil {
-			peerInfo = fmt.Sprintf(" -> peer %s", hex.EncodeToString(c.session.ID[:4]))
+		if session != nil {
+			peerInfo = fmt.Sprintf(" -> peer %s", hex.EncodeToString(session.ID[:4]))
 		}
 		fmt.Printf("  %s%s\n", r, peerInfo)
 	}
@@ -1383,6 +1505,22 @@ func (c *Client) cmdSocks(args []string) {
 	}
 }
 
+func (c *Client) requestExitConfirmation() {
+	c.stateMu.RLock()
+	tunnelUp := c.tunnelStarted
+	hasSession := c.session != nil
+	c.stateMu.RUnlock()
+
+	warning := ""
+	if tunnelUp {
+		warning = " Active tunnel will be torn down."
+	} else if hasSession {
+		warning = " Active session will be closed."
+	}
+	fmt.Printf("\nAre you sure you want to exit?%s (y/N): ", warning)
+	c.confirmingExit.Store(true)
+}
+
 func (c *Client) Shutdown() {
 	c.shutdownOnce.Do(func() {
 		if c.tunnelStarted {
@@ -1480,12 +1618,25 @@ func main() {
 		log.Fatalf("Failed: %v", err)
 	}
 
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	isInteractiveOperator := edPriv != nil && config.StdinIsTTY()
 	go func() {
+		sig := <-sigCh
+		if sig == syscall.SIGTERM || !isInteractiveOperator {
+			fmt.Println("\nShutting down...")
+			go func() {
+				<-sigCh
+				fmt.Println("\nForce quit.")
+				os.Exit(1)
+			}()
+			client.Shutdown()
+			return
+		}
+		client.requestExitConfirmation()
 		<-sigCh
-		fmt.Println("\nShutting down...")
-		client.Shutdown()
+		fmt.Println("\nForce quit.")
+		os.Exit(1)
 	}()
 
 	if err := client.Run(); err != nil {

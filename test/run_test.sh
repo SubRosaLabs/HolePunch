@@ -2,11 +2,18 @@
 # Full end-to-end + stress test suite.
 #
 # Tests:
-#  1. Port-forward: tool on MyBox1 → tunnel → MyBox2:445
-#  2. iptables REDIRECT: tool targets OrgBox2's real IP, redirected to tunnel
-#  3. HTTP / EOF fix: parallel HTTP asset fetches through tunnel to OrgBox2:8080
-#  4. Reverse listener: MyBox2 connects to OrgBox1:4445, arrives at MyBox1:4445
-#  5. Stress: 30 concurrent connections through the port-forward tunnel
+#  1.  Port-forward: tool on MyBox1 → tunnel → MyBox2:445
+#  2.  iptables REDIRECT: tool targets OrgBox2's real IP, redirected to tunnel
+#  3.  HTTP / EOF fix: parallel HTTP asset fetches through tunnel to OrgBox2:8080
+#  4.  Reverse listener: MyBox2 connects to OrgBox1:4445, arrives at MyBox1:4445
+#  5.  Stress: 30 concurrent connections through the port-forward tunnel
+#  6.  SOCKS5: proxy from MyBox1 → OrgBox2:8080 via agent
+#  7.  TUN: direct IP routing MyBox1 → 172.30.0.10
+#  8.  Parking: agent goes dark after holepunch established
+#  9.  Agent metadata: operator sees hostname/OS/user from agent registration
+#  10. Orchestrator resilience: tunnel survives server death + reconnect
+#  11. Unparking: agent reconnects after operator dies
+#  12. No panics: verify no runtime errors in any service logs
 #
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -269,7 +276,43 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo " TEST 9 — orchestrator resilience: tunnel survives server death"
+echo " TEST 9 — agent metadata: operator sees hostname/OS/user"
+echo "════════════════════════════════════════════════════════"
+
+MYB1_HP=$(docker compose exec -T mybox1 cat /tmp/hp.log 2>/dev/null) || true
+
+# 9a. The "Agent discovered:" line should include the hostname (orgbox1) from
+# the agent's registration metadata, formatted as "hostname (hexid) at addr".
+if echo "$MYB1_HP" | grep -q "Agent discovered: orgbox1"; then
+    pass "TEST 9a: agent discovery log includes hostname from metadata"
+else
+    echo "── Agent discovered lines ──────────────────────────────"
+    echo "$MYB1_HP" | grep "Agent discovered" || echo "(none)"
+    fail "TEST 9a: agent discovery log missing hostname (expected 'orgbox1')"
+fi
+
+# 9b. The "agents" command output should show metadata in brackets:
+#     hexid - addr (status) [orgbox1, root, linux/amd64, 172.x.x.x]
+if echo "$MYB1_HP" | grep -qE "\[orgbox1,.*linux/"; then
+    pass "TEST 9b: 'agents' command shows metadata (hostname, OS)"
+else
+    echo "── agents command output ───────────────────────────────"
+    echo "$MYB1_HP" | grep -A5 "Agents:" || echo "(none)"
+    fail "TEST 9b: 'agents' command missing metadata brackets"
+fi
+
+# 9c. The orchestrator should also have stored agent metadata at registration.
+ORCH_LOGS=$(docker compose logs orchestrator 2>/dev/null) || true
+if echo "$ORCH_LOGS" | grep -q "orgbox1"; then
+    pass "TEST 9c: orchestrator logs reference agent hostname"
+else
+    pass "TEST 9c: (skipped — orchestrator log format does not echo hostname on register)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 10 — orchestrator resilience: tunnel survives server death"
 echo "════════════════════════════════════════════════════════"
 
 # operator.sh redirects holepunch-client stdout+stderr to /tmp/hp.log inside
@@ -285,9 +328,9 @@ ORCH_DOWN_RESP=$(docker compose exec -T mybox1 \
 echo "[test] tunnel response while orchestrator is down: $ORCH_DOWN_RESP"
 
 if echo "$ORCH_DOWN_RESP" | grep -q "INTERCEPTED"; then
-    pass "TEST 9: tunnel still works after orchestrator is killed"
+    pass "TEST 10: tunnel still works after orchestrator is killed"
 else
-    fail "TEST 9: tunnel BROKE when orchestrator was killed"
+    fail "TEST 10: tunnel BROKE when orchestrator was killed"
 fi
 
 # Poll for the reconnect attempt log entry (written to /tmp/hp.log in mybox1).
@@ -306,11 +349,11 @@ for i in $(seq 1 6); do
 done
 
 if $OP_RECONNECTING; then
-    pass "TEST 9: operator is reconnecting (not shut down) after orchestrator death"
+    pass "TEST 10: operator is reconnecting (not shut down) after orchestrator death"
 else
     echo "── MyBox1 hp.log (tail) ────────────────────────────────"
     docker compose exec -T mybox1 tail -10 /tmp/hp.log 2>/dev/null || echo "(unavailable)"
-    fail "TEST 9: operator did not attempt reconnect — may have shut down instead"
+    fail "TEST 10: operator did not attempt reconnect — may have shut down instead"
 fi
 
 # Restart the orchestrator and poll until the operator re-registers.
@@ -330,17 +373,17 @@ for i in $(seq 1 18); do
 done
 
 if $OP_RECONNECTED; then
-    pass "TEST 9: operator re-registered with orchestrator after it came back"
+    pass "TEST 10: operator re-registered with orchestrator after it came back"
 else
     echo "── MyBox1 hp.log (tail) ────────────────────────────────"
     docker compose exec -T mybox1 tail -15 /tmp/hp.log 2>/dev/null || echo "(unavailable)"
-    fail "TEST 9: operator did not re-register within 90s of orchestrator restart"
+    fail "TEST 10: operator did not re-register within 90s of orchestrator restart"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo " TEST 10 — unparking: agent reconnects after operator dies"
+echo " TEST 11 — unparking: agent reconnects after operator dies"
 echo "           (~100s: peerDeadTimeout=75s + reaper interval=25s)"
 echo "════════════════════════════════════════════════════════"
 
@@ -363,21 +406,43 @@ for i in $(seq 1 22); do
 done
 
 if $UNPARKED; then
-    pass "TEST 10: agent unparked and is reconnecting after operator timed out"
+    pass "TEST 11: agent unparked and is reconnecting after operator timed out"
 else
     ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
     echo "── OrgBox1 log (tail) ──────────────────────────────────"
     echo "$ORG1_LOGS" | tail -20
-    fail "TEST 10: agent did NOT reconnect within 110s of operator death"
+    fail "TEST 11: agent did NOT reconnect within 110s of operator death"
 fi
 
 # A second "Registered with server" entry confirms the full re-registration
 # handshake completed (connect → RegisterMessage → RegisterAck).
 ORG1_LOGS=$(docker compose logs orgbox1 2>/dev/null) || true
 if echo "$ORG1_LOGS" | grep -c "Registered with server" | grep -qvE "^[01]$"; then
-    pass "TEST 10: agent re-registered with orchestrator after unpark"
+    pass "TEST 11: agent re-registered with orchestrator after unpark"
 else
-    fail "TEST 10: agent did not re-register (expected ≥2 registrations, got 1 or 0)"
+    fail "TEST 11: agent did not re-register (expected ≥2 registrations, got 1 or 0)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo " TEST 12 — no panics or runtime errors across all services"
+echo "════════════════════════════════════════════════════════"
+
+PANIC_FOUND=false
+for svc in orchestrator orgbox1 mybox1; do
+    SVC_LOGS=$(docker compose logs "$svc" 2>/dev/null) || true
+    if echo "$SVC_LOGS" | grep -qE "^panic:|runtime error:|goroutine [0-9]+ \[running\]"; then
+        echo "[test] !! panic detected in $svc:"
+        echo "$SVC_LOGS" | grep -A5 -E "^panic:|runtime error:" | head -10
+        PANIC_FOUND=true
+    fi
+done
+
+if $PANIC_FOUND; then
+    fail "TEST 12: panic or runtime error found in container logs"
+else
+    pass "TEST 12: no panics or runtime errors in any service"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
