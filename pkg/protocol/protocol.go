@@ -58,18 +58,112 @@ func (h *Header) Serialize() []byte {
 	return buf
 }
 
+// Metadata field tags for AgentMetadata TLV encoding.
+type MetadataFieldType uint8
+
+const (
+	MetaUsername MetadataFieldType = 1
+	MetaHostname MetadataFieldType = 2
+	MetaOS       MetadataFieldType = 3
+	MetaArch     MetadataFieldType = 4
+	MetaLocalIPs MetadataFieldType = 5
+)
+
+const MaxMetadataSize = 512
+
+// AgentMetadata carries system information about the registering client.
+type AgentMetadata struct {
+	Username string
+	Hostname string
+	OS       string
+	Arch     string
+	LocalIPs string // comma-separated
+}
+
+// Encode serializes metadata as FieldCount(1) + N x [Tag(1) + Len(2) + Value].
+func (a *AgentMetadata) Encode() []byte {
+	fields := []struct {
+		tag MetadataFieldType
+		val string
+	}{
+		{MetaUsername, a.Username},
+		{MetaHostname, a.Hostname},
+		{MetaOS, a.OS},
+		{MetaArch, a.Arch},
+		{MetaLocalIPs, a.LocalIPs},
+	}
+	var count uint8
+	var payload []byte
+	for _, f := range fields {
+		if f.val == "" {
+			continue
+		}
+		v := f.val
+		if len(v) > 255 {
+			v = v[:255]
+		}
+		payload = append(payload, byte(f.tag))
+		payload = append(payload, byte(len(v)>>8), byte(len(v)))
+		payload = append(payload, []byte(v)...)
+		count++
+	}
+	return append([]byte{count}, payload...)
+}
+
+// ParseAgentMetadata decodes metadata from the TLV encoding produced by Encode.
+func ParseAgentMetadata(data []byte) *AgentMetadata {
+	if len(data) < 1 {
+		return nil
+	}
+	count := int(data[0])
+	offset := 1
+	meta := &AgentMetadata{}
+	for i := 0; i < count; i++ {
+		if offset+3 > len(data) {
+			break
+		}
+		tag := MetadataFieldType(data[offset])
+		vLen := int(binary.BigEndian.Uint16(data[offset+1 : offset+3]))
+		offset += 3
+		if offset+vLen > len(data) {
+			break
+		}
+		val := string(data[offset : offset+vLen])
+		offset += vLen
+		switch tag {
+		case MetaUsername:
+			meta.Username = val
+		case MetaHostname:
+			meta.Hostname = val
+		case MetaOS:
+			meta.OS = val
+		case MetaArch:
+			meta.Arch = val
+		case MetaLocalIPs:
+			meta.LocalIPs = val
+		}
+	}
+	return meta
+}
+
 // RegisterMessage is sent by client to register with the server
 type RegisterMessage struct {
 	ClientID  [32]byte // Unique client identifier
 	PublicKey [32]byte // X25519 public key for encryption
+	Meta      *AgentMetadata
 }
 
 // Serialize serializes the register message
 func (m *RegisterMessage) Serialize() []byte {
-	header := Header{Version: WireVersion, Type: MsgTypeRegister, Length: 64}
+	var metaBuf []byte
+	if m.Meta != nil {
+		metaBuf = m.Meta.Encode()
+	}
+	header := Header{Version: WireVersion, Type: MsgTypeRegister, Length: uint16(64 + len(metaBuf))}
 	buf := header.Serialize()
 	buf = append(buf, m.ClientID[:]...)
 	buf = append(buf, m.PublicKey[:]...)
+	buf = append(buf, metaBuf...)
 	return buf
 }
 
@@ -81,6 +175,9 @@ func ParseRegisterMessage(data []byte) (*RegisterMessage, error) {
 	msg := &RegisterMessage{}
 	copy(msg.ClientID[:], data[0:32])
 	copy(msg.PublicKey[:], data[32:64])
+	if len(data) > 64 {
+		msg.Meta = ParseAgentMetadata(data[64:])
+	}
 	return msg, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/binary"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -25,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -75,20 +77,23 @@ type ClientInfo struct {
 	SessionNonce [32]byte
 	EdPubKey     [auth.PublicKeySize]byte
 	stream       *clientStream
+	Meta         *protocol.AgentMetadata
 }
 
 // Server is the orchestration server.
 type Server struct {
-	h3server   *http3.Server
-	tcpServer  *http.Server
-	clients    map[[32]byte]*ClientInfo
-	mu         sync.RWMutex
-	shutdown   chan struct{}
-	maxClients int
-	stats      *config.Stats
-	authorized auth.AuthorizedKeys
-	authPath   string
-	agentPath  string
+	h3server     *http3.Server
+	tcpServer    *http.Server
+	clients      map[[32]byte]*ClientInfo
+	mu           sync.RWMutex
+	shutdown     chan struct{}
+	shutdownOnce sync.Once
+	maxClients   int
+	stats        *config.Stats
+	authorized   auth.AuthorizedKeys
+	authPath       string
+	agentPath      string
+	confirmingExit atomic.Bool
 }
 
 // NewServer creates a new orchestration server.
@@ -147,6 +152,17 @@ func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Co
 	return s, nil
 }
 
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC in %s: %v", name, r)
+			}
+		}()
+		fn()
+	}()
+}
+
 // Run starts the server.
 func (s *Server) Run() error {
 	log.Printf("%s", config.VersionInfo())
@@ -158,9 +174,9 @@ func (s *Server) Run() error {
 		log.Printf("Loaded %d operator key(s) from %s", len(s.authorized), s.authPath)
 	}
 
-	go s.cleanupStaleClients()
-	go s.logStats()
-	go s.interactiveMode()
+	safeGo("cleanupStaleClients", s.cleanupStaleClients)
+	safeGo("logStats", s.logStats)
+	safeGo("interactiveMode", s.interactiveMode)
 
 	go func() {
 		log.Printf("TCP front on %s (HTTP/1.1 + HTTP/2, Alt-Svc → HTTP/3)", s.tcpServer.Addr)
@@ -172,14 +188,24 @@ func (s *Server) Run() error {
 	return s.h3server.ListenAndServe()
 }
 
+func (s *Server) requestExitConfirmation() {
+	s.mu.RLock()
+	n := len(s.clients)
+	s.mu.RUnlock()
+	fmt.Printf("\nAre you sure you want to exit? %d client(s) connected. (y/N): ", n)
+	s.confirmingExit.Store(true)
+}
+
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown() {
-	log.Println("Shutting down...")
-	close(s.shutdown)
-	s.h3server.Close()
-	if s.tcpServer != nil {
-		s.tcpServer.Close()
-	}
+	s.shutdownOnce.Do(func() {
+		log.Println("Shutting down...")
+		close(s.shutdown)
+		s.h3server.Close()
+		if s.tcpServer != nil {
+			s.tcpServer.Close()
+		}
+	})
 }
 
 // readMsg reads one framed protocol message from a stream.
@@ -330,6 +356,7 @@ func (s *Server) handleRegister(data []byte, addr *net.UDPAddr, cs *clientStream
 		Role:         RoleAgent,
 		SessionNonce: nonce,
 		stream:       cs,
+		Meta:         msg.Meta,
 	}
 	s.clients[msg.ClientID] = client
 	clientCount := len(s.clients)
@@ -479,6 +506,15 @@ func (s *Server) sendPeerListToLocked(recipient *ClientInfo) {
 		peerData = append(peerData, byte(len(addrBytes)))
 		peerData = append(peerData, addrBytes...)
 
+		var metaBytes []byte
+		if peer.Meta != nil {
+			metaBytes = peer.Meta.Encode()
+		}
+		metaLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(metaLen, uint16(len(metaBytes)))
+		peerData = append(peerData, metaLen...)
+		peerData = append(peerData, metaBytes...)
+
 		peerCount++
 	}
 
@@ -567,6 +603,18 @@ func (s *Server) interactiveMode() {
 	fmt.Print(config.Prompt)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+
+		if s.confirmingExit.CompareAndSwap(true, false) {
+			lower := strings.ToLower(line)
+			if lower == "y" || lower == "yes" {
+				s.Shutdown()
+				return
+			}
+			fmt.Println("Exit cancelled.")
+			fmt.Print(config.Prompt)
+			continue
+		}
+
 		if line == "" {
 			fmt.Print(config.Prompt)
 			continue
@@ -616,11 +664,35 @@ func (s *Server) cmdClients() {
 			}
 			extra = fmt.Sprintf("  [%s/%s]", auth.Fingerprint(c.EdPubKey), label)
 		}
-		fmt.Printf("  %s  %-9s  %s  (last seen %s ago)%s\n",
+		metaStr := ""
+		if c.Meta != nil {
+			var parts []string
+			if c.Meta.Hostname != "" {
+				parts = append(parts, c.Meta.Hostname)
+			}
+			if c.Meta.Username != "" {
+				parts = append(parts, c.Meta.Username)
+			}
+			if c.Meta.OS != "" {
+				osInfo := c.Meta.OS
+				if c.Meta.Arch != "" {
+					osInfo += "/" + c.Meta.Arch
+				}
+				parts = append(parts, osInfo)
+			}
+			if c.Meta.LocalIPs != "" {
+				parts = append(parts, c.Meta.LocalIPs)
+			}
+			if len(parts) > 0 {
+				metaStr = fmt.Sprintf("  {%s}", strings.Join(parts, ", "))
+			}
+		}
+		fmt.Printf("  %s  %-9s  %s  (last seen %s ago)%s%s\n",
 			hex.EncodeToString(c.ID[:8]),
 			c.Role,
 			c.Addr.String(),
 			config.FormatDuration(now.Sub(c.LastSeen)),
+			metaStr,
 			extra)
 	}
 }
@@ -773,11 +845,24 @@ func main() {
 		log.Fatalf("Failed to create server: %v", err)
 	}
 
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	isInteractive := config.StdinIsTTY()
 	go func() {
+		sig := <-sigCh
+		if sig == syscall.SIGTERM || !isInteractive {
+			go func() {
+				<-sigCh
+				fmt.Println("\nForce quit.")
+				os.Exit(1)
+			}()
+			server.Shutdown()
+			return
+		}
+		server.requestExitConfirmation()
 		<-sigCh
-		server.Shutdown()
+		fmt.Println("\nForce quit.")
+		os.Exit(1)
 	}()
 
 	if err := server.Run(); err != nil {
