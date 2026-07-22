@@ -403,7 +403,11 @@ func (p *Puncher) SendToPeer(peerID [32]byte, data []byte) error {
 		Ciphertext: ciphertext,
 	}
 
-	_, err = p.conn.WriteTo(msg.Serialize(), peer.Addr)
+	peer.mu.RLock()
+	addr := peer.Addr
+	peer.mu.RUnlock()
+
+	_, err = p.conn.WriteTo(msg.Serialize(), addr)
 	return err
 }
 
@@ -416,7 +420,10 @@ func (p *Puncher) SendKeepalive() {
 	defer p.peersMu.RUnlock()
 
 	for _, peer := range p.peers {
-		p.conn.WriteTo(data, peer.Addr)
+		peer.mu.RLock()
+		addr := peer.Addr
+		peer.mu.RUnlock()
+		p.conn.WriteTo(data, addr)
 	}
 }
 
