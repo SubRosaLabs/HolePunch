@@ -921,9 +921,13 @@ func (m *Manager) Close() {
 	}
 
 	for id, stream := range m.streams {
-		stream.closed = true
-		if stream.Conn != nil {
-			stream.Conn.Close()
+		if stream != nil {
+			stream.mu.Lock()
+			stream.closed = true
+			if stream.Conn != nil {
+				stream.Conn.Close()
+			}
+			stream.mu.Unlock()
 		}
 		delete(m.streams, id)
 	}

@@ -46,12 +46,18 @@ wait_log "Operator authentication granted" "operator authenticated"
 # ── Step 2: wait for peer list (server sends it right after auth) ────────────
 wait_log "Agent discovered:" "agent discovered" 20
 
-AGENT_ID=$(sed -n 's/.*Agent discovered: \([0-9a-f]*\) at.*/\1/p' "$LOG" | head -1)
+# New format: "Agent discovered: hostname (hexid) at addr"
+# Old format: "Agent discovered: hexid at addr"
+AGENT_ID=$(grep "Agent discovered:" "$LOG" | grep -oE '[0-9a-f]{16}' | head -1)
 echo "[mybox1] agent ID: $AGENT_ID"
 
 # ── Step 3: open session (triggers hole punch) ───────────────────────────────
 send_cmd "session $AGENT_ID"
 wait_log "Session:" "session established" 15
+
+# ── Step 3b: display agent metadata (Test 11 validation) ────────────────────
+send_cmd "agents"
+sleep 1
 
 # ── Step 4: set up SMB port forward (existing Test 1 & 2) ────────────────────
 # OrgBox1 dials mybox2:445 for every local connection on 127.0.0.1:445

@@ -32,6 +32,7 @@ services:
     build:
       context: ..
       dockerfile: test/Dockerfile
+    hostname: orgbox1
     command: ["holepunch-client", "-server", "orchestrator:443", "-ignorecert"]
     networks:
       - punchnet
