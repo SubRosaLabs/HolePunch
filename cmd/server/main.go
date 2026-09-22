@@ -9,10 +9,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"encoding/binary"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -82,22 +82,23 @@ type ClientInfo struct {
 
 // Server is the orchestration server.
 type Server struct {
-	h3server     *http3.Server
-	tcpServer    *http.Server
-	clients      map[[32]byte]*ClientInfo
-	mu           sync.RWMutex
-	shutdown     chan struct{}
-	shutdownOnce sync.Once
-	maxClients   int
-	stats        *config.Stats
-	authorized   auth.AuthorizedKeys
+	h3server       *http3.Server
+	tcpServer      *http.Server
+	clients        map[[32]byte]*ClientInfo
+	mu             sync.RWMutex
+	shutdown       chan struct{}
+	shutdownOnce   sync.Once
+	maxClients     int
+	stats          *config.Stats
+	authorized     auth.AuthorizedKeys
 	authPath       string
 	agentPath      string
 	confirmingExit atomic.Bool
+	prewarmTLS     func()
 }
 
 // NewServer creates a new orchestration server.
-func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Config, webroot string) (*Server, error) {
+func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Config, webroot, prewarmDomain string) (*Server, error) {
 	authorized, err := auth.LoadAuthorizedKeys(authPath)
 	if err != nil {
 		return nil, fmt.Errorf("load authorized_keys %s: %w", authPath, err)
@@ -148,6 +149,15 @@ func NewServer(addr, agentPath, authPath string, maxClients int, tlsConf *tls.Co
 		Handler:   tcpHandler,
 		TLSConfig: tlsConf.Clone(),
 	}
+	if prewarmDomain != "" && tlsConf.GetCertificate != nil {
+		s.prewarmTLS = func() {
+			if err := prewarmCertificate(prewarmDomain, tlsConf.GetCertificate); err != nil {
+				log.Printf("Let's Encrypt certificate request for %q failed: %v", prewarmDomain, err)
+				return
+			}
+			log.Printf("Let's Encrypt certificate for %q is ready", prewarmDomain)
+		}
+	}
 
 	return s, nil
 }
@@ -178,12 +188,19 @@ func (s *Server) Run() error {
 	safeGo("logStats", s.logStats)
 	safeGo("interactiveMode", s.interactiveMode)
 
+	tcpListener, err := net.Listen("tcp", s.tcpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen TCP %s: %w", s.tcpServer.Addr, err)
+	}
 	go func() {
 		log.Printf("TCP front on %s (HTTP/1.1 + HTTP/2, Alt-Svc → HTTP/3)", s.tcpServer.Addr)
-		if err := s.tcpServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		if err := s.tcpServer.ServeTLS(tcpListener, "", ""); err != nil && err != http.ErrServerClosed {
 			log.Printf("TCP server: %v", err)
 		}
 	}()
+	if s.prewarmTLS != nil {
+		safeGo("prewarmTLS", s.prewarmTLS)
+	}
 
 	return s.h3server.ListenAndServe()
 }
@@ -775,6 +792,23 @@ func buildTLSConfig(mode, certFile, keyFile, domain, cacheDir string) (*tls.Conf
 	}
 }
 
+// prewarmCertificate starts ACME issuance without waiting for the first client
+// TLS handshake. The TCP listener must already be serving for TLS-ALPN-01.
+func prewarmCertificate(domain string, getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) error {
+	// Match a modern ECDSA-capable client. autocert keys its cache by key type;
+	// an empty ClientHello is treated as RSA-only and would prewarm a different
+	// certificate than normal HolePunch clients subsequently request.
+	hello := &tls.ClientHelloInfo{
+		ServerName:        domain,
+		CipherSuites:      []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256},
+		SignatureSchemes:  []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+		SupportedVersions: []uint16{tls.VersionTLS13, tls.VersionTLS12},
+	}
+	_, err := getCertificate(hello)
+	return err
+}
+
 // generateSelfSignedTLS creates a self-signed ECDSA certificate valid for 10 years.
 func generateSelfSignedTLS() (*tls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -840,7 +874,11 @@ func main() {
 	}
 
 	addr := fmt.Sprintf("%s:%d", *bind, *port)
-	server, err := NewServer(addr, *agentPath, *authPath, *maxClients, tlsConf, *webroot)
+	prewarmDomain := ""
+	if *tlsMode == "letsencrypt" {
+		prewarmDomain = *tlsDomain
+	}
+	server, err := NewServer(addr, *agentPath, *authPath, *maxClients, tlsConf, *webroot, prewarmDomain)
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
