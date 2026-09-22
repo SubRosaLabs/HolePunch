@@ -35,6 +35,7 @@ import (
 	"github.com/abb3rrant/HolePunch/pkg/holepunch"
 	"github.com/abb3rrant/HolePunch/pkg/protocol"
 	"github.com/abb3rrant/HolePunch/pkg/proxy"
+	shellproto "github.com/abb3rrant/HolePunch/pkg/shell"
 )
 
 // peerDeadTimeout is how long a peer may go without traffic before it is
@@ -78,6 +79,12 @@ type Client struct {
 	proxyManager *proxy.Manager
 	stats        *config.Stats
 	startTime    time.Time
+
+	// Shell request state is operator-local. Commands travel only over a live
+	// peer channel that the orchestrator opened for an authenticated operator.
+	shellMu        sync.Mutex
+	shellNextID    uint32
+	shellResponses map[uint32]*shellPending
 
 	// Operator auth. edPrivKey is nil when no -key was passed.
 	edPrivKey    ed25519.PrivateKey
@@ -139,20 +146,21 @@ func NewClient(serverAddr, agentPath string, useIPv6 bool, edPrivKey ed25519.Pri
 	ctx, cancelCtx := context.WithCancel(context.Background())
 
 	c := &Client{
-		conn:       udpConn,
-		qt:         &quic.Transport{Conn: udpConn},
-		ctx:        ctx,
-		cancelCtx:  cancelCtx,
-		shutdown:   make(chan struct{}),
-		serverAddr: serverAddr,
-		agentPath:  agentPath,
-		ignoreCert: ignoreCert,
-		clientID:   clientID,
-		keys:       keys,
-		peers:      make(map[string]*PeerEntry),
-		stats:      config.NewStats(),
-		startTime:  time.Now(),
-		edPrivKey:  edPrivKey,
+		conn:           udpConn,
+		qt:             &quic.Transport{Conn: udpConn},
+		ctx:            ctx,
+		cancelCtx:      cancelCtx,
+		shutdown:       make(chan struct{}),
+		serverAddr:     serverAddr,
+		agentPath:      agentPath,
+		ignoreCert:     ignoreCert,
+		clientID:       clientID,
+		keys:           keys,
+		peers:          make(map[string]*PeerEntry),
+		shellResponses: make(map[uint32]*shellPending),
+		stats:          config.NewStats(),
+		startTime:      time.Now(),
+		edPrivKey:      edPrivKey,
 	}
 
 	c.puncher = holepunch.NewPuncher(udpConn, keys)
@@ -550,6 +558,23 @@ func (c *Client) onDataReceived(peerID [32]byte, data []byte) {
 	if len(data) == 0 {
 		return
 	}
+	if shellproto.IsPacket(data) {
+		if c.operatorRole() {
+			if !c.handleShellResponse(peerID, data) {
+				log.Printf("Rejected shell request from agent %s", hex.EncodeToString(peerID[:8]))
+			}
+			return
+		}
+		handled, err := handleShellPacket(data, func(response []byte) error {
+			return c.puncher.SendToPeer(peerID, response)
+		})
+		if err != nil {
+			log.Printf("Shell packet error: %v", err)
+		}
+		if handled {
+			return
+		}
+	}
 
 	if proxy.IsProxyPacket(data) {
 		if err := c.proxyManager.HandlePacket(peerID, data); err != nil {
@@ -824,6 +849,10 @@ func (c *Client) interactiveMode() {
 			if c.requireOperator("socks") {
 				c.cmdSocks(args[1:])
 			}
+		case "shell":
+			if c.requireOperator("shell") {
+				c.cmdShell(args[1:])
+			}
 		case "stats":
 			c.cmdStats()
 		case "version":
@@ -885,6 +914,9 @@ Reverse listeners (agent binds, operator connects):
 SOCKS (no root needed):
   socks start [port]          - Start SOCKS5 proxy (default: 1080)
   socks stop                  - Stop SOCKS5 proxy
+
+Shell (selected agent must be connected):
+  shell <command>             - Run one command through the selected agent
 
 Info:
   stats                       - Show connection statistics

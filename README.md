@@ -271,6 +271,8 @@ rlistener add <bp>:<host>:<rp>  Agent binds port, forwards inbound to operator
 rlistener del <port>
 rlistener list
 
+shell <command>                 Run one command through the selected agent
+
 stats | version | help | quit
 ```
 
@@ -326,6 +328,8 @@ version | help | quit
 - **Symmetric NATs** may block the punch. If `session <id>` hangs, that's usually why.
 - **`nmap -sS`** uses raw sockets on the operator and bypasses the tunnel — use `-sT`.
 - **SOCKS5 UDP ASSOCIATE** is not implemented (TCP only).
+- **Shell output is capped at 768 bytes** per command so it fits in one encrypted
+  peer datagram; use concise commands or port forwarding for larger transfers.
 - **IPv4 only** on the data plane (orchestrator coordination supports `-6`).
 - **Agents are unauthenticated.** Anyone who runs the binary can register as an
   agent and show up in operators' peer lists. Operator auth only gates the
