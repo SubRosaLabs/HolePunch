@@ -26,19 +26,26 @@ See [RELEASING.md](RELEASING.md) for the obfuscated build and publishing process
 
 ## How it works
 
-The orchestrator server listens on **UDP/443 as an HTTP/3 Server**. Agents and operators connect to it over QUIC. The same high-ephemeral UDP socket the client uses to recieve data from the server is used for peer-to-peer hole punching, so the server can share the NAT-mapped endpoint with peers for direct tuinneling. Once two peers have punched to each other, all data flows **directly** to each other and the orchestrator is no longer needed.
+The public orchestrator listens on **UDP/443**. Agents and operators register over **HTTP/3 over QUIC**, each using a local UDP socket that is also used for peer traffic. The server observes each client's public, NAT-mapped IP and port and introduces the peers to each other.
 
-Because the transport is standard HTTP/3 and supports HTTP/1.1 and HTTP/2, a decoy website (`-webroot`) can be served through the orchestration server. Regular HTTPS traffic hits the static files; agent connections POST to a configurable path that looks like any other web endpoint.
+![Established HolePunch tunnel: the operator and agent exchange encrypted UDP through their NATs, the operator retains its server channel, and the agent forwards traffic to a private service.](assets/udp-holepunching.png)
 
-```
-Agent ──QUIC/HTTP3──► Orchestrator:443 ◄──QUIC/HTTP3── Operator
-         (register, wait for punch coords)
-              │
-              └─── server hands each side the other's UDP endpoint
-              │
-Agent ──raw UDP─────────────────────────────────────── Operator
-         (ChaCha20-Poly1305 encrypted peer tunnel)
-```
+<details>
+<summary>Watch the six-stage UDP hole-punching walkthrough</summary>
+
+![Animated walkthrough: register with the server, exchange peer endpoints and keys, potentially drop an early probe, send probes from both sides, establish the encrypted tunnel, and show a destination-dependent NAT failure.](assets/udp-holepunching.gif)
+
+</details>
+
+1. **Register.** Outbound QUIC traffic creates NAT state. The server learns each public endpoint; the operator authenticates with its Ed25519 key.
+2. **Introduce.** The operator requests a session. The server sends each side a `PunchInit` containing the other peer's ID, X25519 public key, and public IP:port.
+3. **Punch.** Both clients send five raw UDP `KeyExchange` probes, 50 ms apart, from their existing sockets. An early probe can be dropped before the other side sends. With compatible NAT mappings and filtering, outbound probes create state that admits peer packets.
+4. **Tunnel.** Each peer computes an X25519 shared secret. Data is encrypted with **XChaCha20-Poly1305** and sent **directly between the peers over raw UDP**. SOCKS5, port forwarding, and TUN use this peer tunnel; the orchestrator carries no tunnel payload.
+5. **Keep the path alive.** Peer keepalives run every 25 seconds. A connected agent closes its orchestration channel; the operator stays connected to discover and connect to other agents. The agent reconnects to the server if its last peer times out.
+
+**NAT limitation:** reusing a local socket does not guarantee the same public mapping for every destination. A symmetric (destination-dependent) NAT may assign a different port for the peer than it did for the server, making the advertised endpoint unusable. Blocked outbound UDP can also prevent connection. There is no relay fallback in the current implementation.
+
+The orchestrator can also serve a decoy website (`-webroot`) over HTTPS, with HTTP/1.1 and HTTP/2 support. Regular requests receive static files; clients POST to the configured agent path for orchestration.
 
 ## Quick start
 
