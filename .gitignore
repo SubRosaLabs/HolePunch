@@ -1,5 +1,8 @@
 # Binaries
 bin/
+# Legacy root-level build outputs (not source files)
+/server
+/client
 *.exe
 *.exe~
 *.dll
