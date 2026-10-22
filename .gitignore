@@ -9,6 +9,10 @@ bin/
 # Test binary
 *.test
 
+# Python release-tool cache
+__pycache__/
+*.pyc
+
 # Go workspace
 go.work
 go.work.sum

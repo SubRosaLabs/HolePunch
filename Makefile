@@ -1,18 +1,27 @@
-.PHONY: all build clean server client test fmt lint
+.PHONY: all build clean server client test fmt lint release checksums check-release-tools dry-run-release publish-release
 
 # Build output directory
 BUILD_DIR := bin
+RELEASE_DIR := $(BUILD_DIR)/release
+GO ?= go
+GARBLE ?= garble
+PYTHON ?= python3
+GARBLE_VERSION := v0.14.2
+RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 # Version info
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+RELEASE_DATE := $(shell git show -s --format=%cI HEAD 2>/dev/null || echo "unknown")
 
-# Go build flags
-LDFLAGS := -s -w \
-	-X 'github.com/abb3rrant/HolePunch/pkg/config.Version=$(VERSION)' \
-	-X 'github.com/abb3rrant/HolePunch/pkg/config.Commit=$(COMMIT)' \
+# Go build flags; releases use the commit date for repeatable metadata.
+LDFLAGS_VERSION := -X 'github.com/abb3rrant/HolePunch/pkg/config.Version=$(VERSION)' \
+	-X 'github.com/abb3rrant/HolePunch/pkg/config.Commit=$(COMMIT)'
+LDFLAGS := -s -w $(LDFLAGS_VERSION) \
 	-X 'github.com/abb3rrant/HolePunch/pkg/config.BuildDate=$(BUILD_DATE)'
+RELEASE_LDFLAGS := -s -w $(LDFLAGS_VERSION) \
+	-X 'github.com/abb3rrant/HolePunch/pkg/config.BuildDate=$(RELEASE_DATE)'
 
 # CGO disabled for static binaries
 export CGO_ENABLED=0
@@ -63,27 +72,39 @@ run-server: server
 run-client: client
 	./$(BUILD_DIR)/holepunch-client
 
-# Build for multiple platforms
-release:
-	@mkdir -p $(BUILD_DIR)/release
-	@echo "Building version $(VERSION)..."
-	# Linux AMD64
-	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-server-linux-amd64 ./cmd/server
-	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-client-linux-amd64 ./cmd/client
-	# Linux ARM64
-	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-server-linux-arm64 ./cmd/server
-	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-client-linux-arm64 ./cmd/client
-	# macOS AMD64
-	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-server-darwin-amd64 ./cmd/server
-	GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-client-darwin-amd64 ./cmd/client
-	# macOS ARM64
-	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-server-darwin-arm64 ./cmd/server
-	GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-client-darwin-arm64 ./cmd/client
-	# Windows AMD64
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-server-windows-amd64.exe ./cmd/server
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/release/holepunch-client-windows-amd64.exe ./cmd/client
-	@echo "Release binaries in $(BUILD_DIR)/release/"
+# Release builds are separate from the normal, debuggable "make build" artifacts.
+# Pin Garble to the last release supporting Go 1.24; -tiny is intentionally
+# omitted so panic diagnostics remain available to OSS users.
+check-release-tools:
+	@command -v $(GARBLE) >/dev/null || { echo "Install Garble: go install mvdan.cc/garble@$(GARBLE_VERSION)" >&2; exit 1; }
+	@case "$$($(GARBLE) version)" in *"mvdan.cc/garble $(GARBLE_VERSION)"*) ;; *) echo "Garble $(GARBLE_VERSION) required" >&2; exit 1;; esac
+	@case "$$($(GO) version)" in *"go1.24."*) ;; *) echo "Go 1.24.x required for Garble $(GARBLE_VERSION)" >&2; exit 1;; esac
+	@command -v $(PYTHON) >/dev/null || { echo "python3 is required for release verification" >&2; exit 1; }
 
-# Create checksums for release
+release: check-release-tools
+	@rm -rf -- $(RELEASE_DIR)
+	@mkdir -p $(RELEASE_DIR)
+	@set -eu; for target in $(RELEASE_TARGETS); do \
+		os=$${target%/*}; arch=$${target#*/}; ext=""; \
+		if [ "$$os" = windows ]; then ext=.exe; fi; \
+		for role in server client; do \
+			out="$(RELEASE_DIR)/holepunch-$$role-$$os-$$arch$$ext"; \
+			printf 'Building %s\n' "$$out"; \
+			GOOS=$$os GOARCH=$$arch $(GARBLE) -literals build -trimpath -ldflags "$(RELEASE_LDFLAGS)" -o "$$out" "./cmd/$$role"; \
+		done; \
+	done
+	@$(PYTHON) scripts/verify_release.py $(RELEASE_DIR)
+
+# Revalidate the complete release set and regenerate SHA256SUMS.
 checksums:
-	cd $(BUILD_DIR)/release && sha256sum * > SHA256SUMS
+	@$(PYTHON) scripts/verify_release.py $(RELEASE_DIR)
+
+# Publication is explicit, never part of "make release". Require a tag already
+# present on GitHub and matching the local HEAD, plus human-written notes.
+dry-run-release: checksums
+	@test -n "$(TAG)" && test -n "$(NOTES_FILE)" || { echo "usage: make dry-run-release TAG=vX.Y.Z NOTES_FILE=path" >&2; exit 2; }
+	@$(PYTHON) scripts/publish_release.py "$(TAG)" --notes-file "$(NOTES_FILE)" --directory $(RELEASE_DIR)
+
+publish-release: checksums
+	@test -n "$(TAG)" && test -n "$(NOTES_FILE)" || { echo "usage: make publish-release TAG=vX.Y.Z NOTES_FILE=path" >&2; exit 2; }
+	@$(PYTHON) scripts/publish_release.py "$(TAG)" --notes-file "$(NOTES_FILE)" --directory $(RELEASE_DIR) --publish
