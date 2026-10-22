@@ -20,7 +20,9 @@ make release         # cross-compile linux/macos/windows
 make test            # go test -race ./...
 ```
 
-Requires Go 1.24+. Pre-built binaries: [Releases](https://github.com/abb3rrant/HolePunch/releases).
+Requires Go 1.24+. When published, pre-built binaries are available on
+[GitHub Releases](https://github.com/SubRosaLabs/HolePunch/releases).
+See [RELEASING.md](RELEASING.md) for the obfuscated build and publishing process.
 
 ## How it works
 
