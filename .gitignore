@@ -35,3 +35,9 @@ Thumbs.db
 agentdocs/
 holepunch_context.md
 .claude
+.hermes/
+
+# Generated test credentials (run test/setup.sh to create)
+test/keys/operator.key
+test/keys/operator.key.pub
+test/authorized_keys

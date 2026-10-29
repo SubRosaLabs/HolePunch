@@ -341,6 +341,10 @@ version | help | quit
   orchestrator, use `-tls-mode cert` or `letsencrypt` on production
   infrastructure where you need orchestrator-identity pinning.
 
+## Contact
+
+Questions, engagement enquiries and security reports: **consulting@sub-rosa-labs.com**
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
